@@ -15,3 +15,4 @@ https://royrenyu.github.io/
 
 - 页面本身是纯静态单文件，选号房间数据走公共临时云存储，需要联网。
 - `index.html` 由 GitHub Actions 从源地址同步生成，改内容请改源文件后重跑 workflow（Actions → Seed index.html → Run workflow）。
+{"mime":"application/x-doubao-infinite-canvas+json","version":1,"token":"clipboard-token:1c53e9ba-d30a-4489-b7bd-05f6762880a9"}
