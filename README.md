@@ -9,3 +9,5 @@ https://royrenyu.github.io/
 - `index.html` 由 GitHub Actions 从源地址同步生成，改内容请改源文件后重跑 workflow（Actions → Seed index.html → Run workflow）。
 - 往 main 推送任何非 index.html 的改动（包括改这份 README）也会自动触发一次同步，等于顺手拉取最新源文件。
 - 上方使用说明图由 Actions 下载到 `assets/usage.png`，同样在重跑时同步。
+## 更新记录
+- 2026-11-24：通灵师改为每晚可查任意一名玩家的真实身份；机械狼改为一场一次学习，按学习对象继承技能，被查验时会伪装成学习对象。
