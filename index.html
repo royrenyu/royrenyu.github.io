@@ -834,7 +834,7 @@ const ROLE_DEFS = {
   guard:    {name:'守卫',   badge:'守', camp:'god',  color:'#83dcae', order:1, wake:'guard',  brief:'每晚守护一人，不可连守'},
   witch:    {name:'女巫',   badge:'女', camp:'god',  color:'#bda5ee', order:3, wake:'witch',  brief:'解药与毒药各一瓶'},
   seer:     {name:'预言家', badge:'预', camp:'god',  color:'#8fc4ec', order:4, wake:'seer',   brief:'每晚查验一人阵营'},
-  medium:   {name:'通灵师', badge:'灵', camp:'god',  color:'#7fd3c8', order:5, wake:'medium', brief:'每晚查验一名死者身份'},
+  medium:   {name:'通灵师', badge:'灵', camp:'god',  color:'#7fd3c8', order:5, wake:'medium', brief:'每晚查验一名玩家的真实身份'},
   hunter:   {name:'猎人',   badge:'猎', camp:'god',  color:'#f0ab74', order:6, wake:'notice', brief:'出局时可开枪'},
   knight:   {name:'骑士',   badge:'骑', camp:'god',  color:'#9fc7e8', order:null, wake:null,  brief:'白天决斗，狼死或骑士死'},
   idiot:    {name:'白痴',   badge:'白', camp:'god',  color:'#e6a2c1', order:null, wake:null,  brief:'被投出翻牌免死'},
@@ -1092,8 +1092,8 @@ function nightStepFor(a){
 
     case 'medium':
       title = nm + '请睁眼';
-      quote = nm + '请睁眼。请选择一名已出局的玩家，查看 ta 的真实身份。';
-      tip = '只能查验死者。若目前还没有人出局，本环节直接跳过，说「今晚无人可查」即可。';
+      quote = nm + '请睁眼。请选择一名玩家，查看 ta 的真实身份。';
+      tip = '今晚可查任意一位玩家，存活或已出局都行；查到的是具体身份牌，不只是阵营。每回合限查一人。';
       return {key:'r_'+a.role, role:a.role, pick:'medium', wake:'medium', title, screen:title, quote, tip};
 
     case 'notice':
@@ -1534,19 +1534,16 @@ function buildActionHTML(st){
   if(st.wake === 'medium'){
     const target = n.medium;
     html += '<div class="action-box">'
-      + '<div class="action-label">通灵 · 查验死者</div>';
-    const dead = state.players.filter(p=>!p.alive);
-    if(!dead.length){
-      html += '<div class="hint-warn">目前还没有人出局，本环节直接跳过。说「今晚无人可查」后让 ta 闭眼。</div>';
-    }else if(!target){
-      html += empty('点击一位已出局的座位查看其身份');
+      + '<div class="action-label">通灵 · 查验身份</div>';
+    if(!target){
+      html += empty('点击任意座位，查看 ta 的真实身份');
     }else{
       const p = getP(target);
       html += chip(target)
         + '<div class="verdict ' + (ROLES[p.role].camp==='wolf'?'wolf':'good') + '">' + ROLES[p.role].name + '</div>'
-        + '<div class="tip">悄悄告知 '+esc(p.name)+' 的真实身份。</div>';
+        + '<div class="tip">悄悄告知 '+esc(p.name)+' 的真实身份'+(p.alive?'（在场存活）':'（已出局）')+'，别让其他人听到。</div>';
     }
-    if(dead.length) html += '<div class="btn-row"><button class="btn" data-act="medium-clear">清除重选</button></div>';
+    html += '<div class="btn-row"><button class="btn" data-act="medium-clear">清除重选</button></div>';
     html += '</div>';
   }
 
@@ -1841,10 +1838,12 @@ function onSeatClick(seat){
       renderAll();
       break;
     case 'medium':
-      if(p.alive){ toast('通灵师只能查验已出局的玩家'); return; }
       snap();
       state.night.medium = (state.night.medium === seat ? null : seat);
-      if(state.night.medium) log('通灵师查验死者 '+fmtSeat(seat)+' 号 '+p.name+' → '+ROLES[p.role].name);
+      if(state.night.medium){
+        log('通灵师查验 '+fmtSeat(seat)+' 号 '+p.name+'（'+(p.alive?'存活':'已出局')+'）→ '+ROLES[p.role].name,
+            ROLES[p.role].camp==='wolf'?'danger':'ok');
+      }
       renderAll();
       break;
     case 'pick': {
@@ -2724,7 +2723,7 @@ const RULE_TABS = [
     <h4>守卫</h4>
     <p>每晚守护一人，被守护者当晚不会被狼刀杀死。<strong>不能连续两晚守护同一人</strong>；守护对毒药无效。</p>
     <h4>通灵师</h4>
-    <p>每晚可以查验<strong>一名已出局的玩家</strong>，得知 ta 的具体身份（能查出是哪张神牌，而不只是阵营）。没有死人时本环节直接跳过。工具里只能点已出局的座位。</p>
+    <p>每晚可以查验<strong>一名玩家</strong>，存活或已出局都可以，得知 ta 的具体身份（能查出是哪张牌，而不只是阵营）。<strong>每回合限查一人</strong>。工具里任意座位都能点，结果会标注对方是否存活。</p>
     <h4>骑士</h4>
     <p><strong>白天技能</strong>，不是夜间角色。白天可以指定一名玩家决斗：对方是狼人则狼人当场出局，对方不是狼人则骑士自己出局。<strong>一局只能决斗一次</strong>。工具会把它排在白天流程第一步，用完自动消失。</p>
     <h4>白狼王</h4>
