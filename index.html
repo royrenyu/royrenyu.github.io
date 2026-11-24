@@ -92,7 +92,7 @@ body::before{
   display:flex;flex-direction:column;overflow-y:auto;padding:14px;gap:12px;
 }
 .stage-card{
-  position:relative;border-radius:16px;padding:16px 16px 15px;overflow:hidden;
+  position:relative;border-radius:16px;padding:16px 16px 15px;overflow:hidden;flex:0 0 auto;
   background:linear-gradient(158deg,rgba(30,36,50,.92),rgba(15,18,26,.94));
   border:1px solid rgba(216,189,122,.2);
   box-shadow:0 12px 34px rgba(0,0,0,.4),inset 0 1px 0 rgba(255,255,255,.05);
@@ -829,7 +829,7 @@ const ROLE_DEFS = {
   wolf:     {name:'狼人',   badge:'狼', camp:'wolf', color:'#f08079', order:2, wake:'kill',   brief:'夜晚集体商议击杀'},
   whiteWolf:{name:'白狼王', badge:'白', camp:'wolf', color:'#f2928a', order:2, wake:'kill',   brief:'白天自爆带走一人'},
   blackWolf:{name:'黑狼王', badge:'黑', camp:'wolf', color:'#c96a62', order:2, wake:'kill',   brief:'出局时可带走一人'},
-  mechWolf: {name:'机械狼', badge:'机', camp:'wolf', color:'#dc9a9a', order:2.3, wake:'copy',  brief:'单独睁眼复制一人技能'},
+  mechWolf: {name:'机械狼', badge:'机', camp:'wolf', color:'#dc9a9a', order:2.3, wake:'learn', brief:'一场一次，学习一名玩家技能'},
   beauty:   {name:'狼美人', badge:'美', camp:'wolf', color:'#e8a9c4', order:2.6, wake:'charm', brief:'单独睁眼魅惑一人，出局时同死'},
   guard:    {name:'守卫',   badge:'守', camp:'god',  color:'#83dcae', order:1, wake:'guard',  brief:'每晚守护一人，不可连守'},
   witch:    {name:'女巫',   badge:'女', camp:'god',  color:'#bda5ee', order:3, wake:'witch',  brief:'解药与毒药各一瓶'},
@@ -843,6 +843,25 @@ const ROLE_DEFS = {
 const ROLES = ROLE_DEFS;
 const ROLE_COLOR = {};
 Object.keys(ROLE_DEFS).forEach(k=>{ ROLE_COLOR[k] = ROLE_DEFS[k].color; });
+
+/* 机械狼学习方法：学谁得谁技能 */
+const MECH_SKILL = {
+  medium:  {label:'通灵师', timing:'下一晚起', text:'每晚可查验一名玩家的真实身份（先刀后验）'},
+  witch:   {label:'女巫',   timing:'下一晚起', text:'可在之后任一夜晚毒杀一人，穿盾，整局一瓶'},
+  hunter:  {label:'猎人',   timing:'当晚起',   text:'出局时可带走一人（与狼王一致，被毒不触发）'},
+  guard:   {label:'守卫',   timing:'下一晚起', text:'可守护一人一次，被守者当晚免疫所有夜间伤害'},
+  wolf:    {label:'狼人',   timing:'下一晚起', text:'每夜在狼人合议前先单独击杀一人'},
+  villager:{label:'村民',   timing:'—',        text:'没有特殊技能'}
+};
+/* 通灵师查验机械狼时看到的结果：学过人则伪装成对方，没学过是「大狼」 */
+function revealRoleOf(p){
+  if(p && p.role === 'mechWolf'){
+    const m = state.mech || {};
+    if(m.taught && m.learned) return (ROLES[m.learned] || {}).name || '大狼';
+    return '大狼';
+  }
+  return (ROLES[p.role] || {}).name || '未知';
+}
 
 const CAUSE_LABEL = {
   wolf:'狼人击杀', poison:'女巫毒杀', vote:'投票放逐', shot:'猎人枪杀',
@@ -955,7 +974,9 @@ function createState(cfgOrKey, names){
     stepKey: 'nightfall',
     pickMode: null,
     night: {kill:null, save:false, poison:null, guard:null, guardPrev:null, seer:null,
-            charm:null, copy:null, medium:null},
+            charm:null, copy:null, medium:null,
+            mechLearn:null, mechSeer:null, mechPoison:null, mechGuard:null, mechKill:null},
+    mech: {taught:false, learned:null, day:0, target:null, poisonUsed:false, guardUsed:false},
     witch: {saveUsed:false, poisonUsed:false},
     boomUsed: false,
     duelUsed: false,
@@ -1015,7 +1036,7 @@ function pickOf(wake){
 }
 
 /* 收集当前夜里需要唤醒的角色：普通狼合并为一个环节，
-   机械狼复制、狼美人魅惑各自单独睁眼 */
+   机械狼的学习、狼美人魅惑各自单独睁眼 */
 function nightActors(){
   const found = {};
   state.players.forEach(p=>{
@@ -1033,8 +1054,34 @@ function nightActors(){
   if(list.some(a=>a.camp === 'wolf')){
     out.push({role:'wolf', order:2, wake:'kill'});
   }
+
+  /* 机械狼：一场只能学一次，学会的技能按各自时机单独出环节 */
+  const mw = state.players.find(p=>p.role === 'mechWolf' && p.alive);
+  if(mw){
+    const mech = state.mech || {taught:false};
+    // 每夜固定睁眼一次：没学过是「学习」，学过则是「确认已学」，保证流程不断档
+    out.push({role:'mechWolf', order:2.3, wake:'learn'});
+    if(mech.taught){
+      const fromNextNight = state.day > (mech.day || 0);   // 学完的下一夜起生效
+      if(mech.learned === 'wolf' && fromNextNight){
+        out.push({role:'mechWolf', order:1.9, wake:'mechKill'});    // 先刀，再进狼窝
+      }
+      if(mech.learned === 'medium' && fromNextNight){
+        out.push({role:'mechWolf', order:2.35, wake:'mechSeer'});   // 先刀后验
+      }
+      if(mech.learned === 'witch' && fromNextNight && !mech.poisonUsed){
+        out.push({role:'mechWolf', order:2.4, wake:'mechPoison'});
+      }
+      if(mech.learned === 'guard' && fromNextNight && !mech.guardUsed){
+        out.push({role:'mechWolf', order:2.4, wake:'mechGuard'});
+      }
+      // 学猎人当晚起在死亡时触发；学村民没有环节
+    }
+  }
+
   list.forEach(a=>{
     if(a.camp === 'wolf' && a.wake === 'kill') return;  // 已并入狼人环节
+    if(a.role === 'mechWolf') return;                   // 机械狼环节在上面单独生成
     out.push({role:a.role, order:a.order, wake:a.wake});
   });
   return out.sort((a,b)=>a.order-b.order);
@@ -1052,7 +1099,7 @@ function nightStepFor(a){
       quote = '狼人请睁眼，互相确认队友后，决定今晚要击杀谁。';
       tip = '点选一个座位作为击杀目标；狼队决定空刀时点「空刀」。';
       if(aliveRole('beauty')) tip += ' 狼美人另需指认一名魅惑对象。';
-      if(aliveRole('mechWolf')) tip += ' 机械狼可指认一人复制其技能。';
+      if(aliveRole('mechWolf')) tip += ' 机械狼的学习与继承技能在它自己的环节单独处理。';
       if(aliveRole('whiteWolf')) tip += ' 白狼王若今晚想自爆，等到白天再处理。';
       return {key:'wolf', role:'wolf', pick:'kill', wake:'kill', title, screen:title, quote, tip};
 
@@ -1075,11 +1122,45 @@ function nightStepFor(a){
       tip = '点选座位后向 ta 单独示意：好人还是狼人。';
       return {key:'r_'+a.role, role:a.role, pick:a.wake, wake:a.wake, title, screen:title, quote, tip};
 
-    case 'copy': {
-      title = nm + '请睁眼';
-      quote = nm + '请睁眼。请单独选择一名玩家，复制 ta 的技能。';
-      tip = '这个环节只有机械狼睁眼，狼队其他人不参与。点选座位记录复制对象；复制后是当晚生效还是次晚生效，开局前口头约定。';
-      return {key:'r_'+a.role, role:a.role, pick:'copy', wake:'copy', title, screen:title, quote, tip};
+    case 'learn': {
+      const mech = state.mech || {};
+      title = '机械狼请睁眼';
+      if(mech.taught){
+        quote = '机械狼请睁眼。本局已经学过技能，学习机会用完了。';
+        tip = '让机械狼睁眼看一眼后闭眼即可，本局不能再学新技能。';
+      }else{
+        quote = '机械狼请睁眼。你可以学习一名玩家的技能，本局只有这一次机会，也可以这夜先不学。';
+        tip = '点座位选学习对象，确认后立即写出学会的技能。生效时间不同：通灵师/女巫/守卫/狼人下一夜起，猎人当晚起，村民学了没技能。';
+      }
+      return {key:'r_mechLearn', role:'mechWolf', pick:'learn', wake:'learn', title, screen:title, quote, tip};
+    }
+
+    case 'mechSeer': {
+      title = '机械狼 · 查验身份';
+      quote = '机械狼请睁眼，本局已学会通灵师技能。请选择一名玩家，查看 ta 的真实身份。';
+      tip = '先刀后验：这一步排在狼人刀人之后。结果只给机械狼一人看，不要让其他狼听到。';
+      return {key:'r_mechSeer', role:'mechWolf', pick:'mechSeer', wake:'mechSeer', title, screen:title, quote, tip};
+    }
+
+    case 'mechPoison': {
+      title = '机械狼 · 毒杀';
+      quote = '机械狼请睁眼，本局已学会女巫技能。请选择今晚要毒杀的人。';
+      tip = '毒药无视守卫（穿盾），整局只有一瓶。这夜不用就点「本夜不用毒」。';
+      return {key:'r_mechPoison', role:'mechWolf', pick:'mechPoison', wake:'mechPoison', title, screen:title, quote, tip};
+    }
+
+    case 'mechGuard': {
+      title = '机械狼 · 守护';
+      quote = '机械狼请睁眼，本局已学会守卫技能。请选择今晚要守护的人。';
+      tip = '被守护者当晚免疫所有夜间伤害，刀和毒都杀不死。整局只能守一次。';
+      return {key:'r_mechGuard', role:'mechWolf', pick:'mechGuard', wake:'mechGuard', title, screen:title, quote, tip};
+    }
+
+    case 'mechKill': {
+      title = '机械狼 · 先行击杀';
+      quote = '机械狼请睁眼，本局已学会狼人技能。先单独击杀一人，之后狼队再合议刀人。';
+      tip = '这一刀在狼队合议之前单独结算，也可以空刀。';
+      return {key:'r_mechKill', role:'mechWolf', pick:'mechKill', wake:'mechKill', title, screen:title, quote, tip};
     }
 
     case 'charm': {
@@ -1220,7 +1301,8 @@ function startNewNight(){
   state.stepKey = 'nightfall';
   state.pickMode = null;
   state.night = {kill:null, save:false, poison:null, guard:null, guardPrev:prevGuard, seer:null,
-                 charm:null, copy:null, medium:null};
+                 charm:null, copy:null, medium:null,
+                 mechLearn:null, mechSeer:null, mechPoison:null, mechGuard:null, mechKill:null};
   state.charmPrev = prevCharm || null;
   state.votes = {};
   state.speakPointer = null;
@@ -1248,6 +1330,7 @@ function nextShot(){
 function shotHolderText(type){
   if(type === 'blackWolf') return '黑狼王';
   if(type === 'whiteWolf') return '白狼王';
+  if(type === 'mechHunter') return '机械狼(猎人)';
   return '猎人';
 }
 
@@ -1277,6 +1360,15 @@ function killSeat(seat, cause){
     if(cause === 'vote' || cause === 'shot' || cause === 'pierce' || cause === 'wolf' || cause === 'duel' || cause === 'boom'){
       requestShot(seat, 'blackWolf');
       log('黑狼王技能触发：可带走一名玩家', 'sys');
+    }
+  }
+  /* 机械狼学到的猎人技能：出局时可带走一人，被毒不触发（与狼王一致） */
+  if(p.role === 'mechWolf' && state.mech && state.mech.taught && state.mech.learned === 'hunter' && !p.tags.includes('shotUsed')){
+    if(cause === 'poison'){
+      log('机械狼被毒杀，学来的猎人技能无法发动', 'sys');
+    }else{
+      requestShot(seat, 'mechHunter');
+      log('机械狼（已学猎人）技能触发：可带走一名玩家', 'sys');
     }
   }
   if(p.role === 'beauty' && cause !== 'beauty'){
@@ -1320,15 +1412,27 @@ function updateWin(){
 
 /* 计算昨夜死亡名单（不改状态） */
 function computeDeaths(){
-  const n = state.night, out = [];
-  if(n.kill && !n.save && n.guard !== n.kill) out.push({seat:n.kill, cause:'wolf'});
-  if(n.poison && n.poison !== n.kill) out.push({seat:n.poison, cause:'poison'});
+  const n = state.night, out = [], seen = {};
+  const add = (seat, cause)=>{
+    if(!seat || seen[seat]) return;
+    seen[seat] = true;
+    out.push({seat, cause});
+  };
+  const mGuard = n.mechGuard;                          // 机械狼学守卫：被守者免疫所有夜间伤害
+  if(n.kill && !n.save && n.guard !== n.kill && mGuard !== n.kill) add(n.kill, 'wolf');
+  if(n.mechKill && mGuard !== n.mechKill) add(n.mechKill, 'pierce');      // 机械狼独立一刀，真守卫挡不住
+  if(n.poison && mGuard !== n.poison) add(n.poison, 'poison');
+  if(n.mechPoison && mGuard !== n.mechPoison) add(n.mechPoison, 'poison'); // 机械狼毒，穿盾
   return out;
 }
 
 function resolveDawn(){
   if(state.dawnResolved) return;
   const deaths = computeDeaths();
+  if(state.mech){
+    if(state.night.mechPoison) state.mech.poisonUsed = true;   // 毒药整局一瓶
+    if(state.night.mechGuard) state.mech.guardUsed = true;     // 守护整局一次
+  }
   state.dawnResolved = true;
   if(!deaths.length){
     log('昨夜是平安夜，无人出局', 'ok');
@@ -1473,7 +1577,7 @@ function buildActionHTML(st){
       '<div class="btn-row"><button class="btn" data-act="kill-clear">空刀</button></div>');
 
     if(aliveRole('beauty') || aliveRole('mechWolf')){
-      html += '<div class="tip">狼队先合议刀人。狼美人的魅惑、机械狼的复制由他们各自单独睁眼处理，不在这里做。</div>';
+      html += '<div class="tip">狼队先合议刀人。狼美人的魅惑、机械狼的学习与继承技能都由他们各自单独睁眼处理，不在这里做。</div>';
     }
 
     if(aliveRole('whiteWolf')){
@@ -1482,11 +1586,62 @@ function buildActionHTML(st){
   }
 
   if(st.role === 'mechWolf'){
-    html += box('机械狼 · 复制目标',
-      n.copy ? chip(n.copy) : empty('点击座位指定今晚复制的对象'),
-      '<div class="tip">只有机械狼一人睁眼，其他人不参与。本工具只记录目标，复制后怎么生效按你们的村规由上帝口头结算。</div>',
-      '<div class="btn-row"><button class="btn" data-act="copy-pick">重新指定</button>'
-      + '<button class="btn" data-act="copy-clear">清除</button></div>');
+    if(st.wake === 'learn'){
+      const mech = state.mech || {};
+      if(mech.taught){
+        const sk = MECH_SKILL[mech.learned] || {label:'—', text:'', timing:''};
+        html += box('机械狼 · 已学（本局仅一次）',
+          empty('学习机会已用完，本局不能再学'),
+          '<div class="tip">第 '+mech.day+' 夜学过'+(mech.target?(' '+fmtSeat(mech.target)+' 号'):'')
+            + '，学到「'+sk.label+'」：'+esc(sk.text)+'（'+sk.timing+'生效）。</div>',
+          '');
+      }else{
+        const cand = n.mechLearn ? getP(n.mechLearn) : null;
+        const sk = cand ? MECH_SKILL[cand.role] : null;
+        html += box('机械狼 · 学习（本局仅一次）',
+          cand ? chip(n.mechLearn) : empty('点击座位选择要学习的对象'),
+          (cand && sk)
+            ? '<div class="tip">学会「'+sk.label+'」的技能：'+esc(sk.text)+'。生效时机：'+sk.timing+'。</div>'
+              + '<div class="hint-warn">确认后本局不能再学、也不能更换，想清楚再点。</div>'
+            : '<div class="tip">只有机械狼一个人睁眼。可以这夜先不学，之后任意一夜再学，但整局只有一次机会。</div>',
+          '<div class="btn-row">'
+            + '<button class="btn btn-danger" data-act="mech-learn-confirm" '+(cand?'':'disabled')+'>确认学习</button>'
+            + '<button class="btn" data-act="mech-learn-clear" '+(cand?'':'disabled')+'>取消选择</button>'
+          + '</div>');
+      }
+    }
+
+    if(st.wake === 'mechSeer'){
+      const t = n.mechSeer ? getP(n.mechSeer) : null;
+      html += box('机械狼 · 查验身份',
+        n.mechSeer ? chip(n.mechSeer, null, revealRoleOf(t)) : empty('点击座位选择要查验的人'),
+        t
+          ? '<div class="verdict '+(ROLES[t.role].camp==='wolf'?'wolf':'good')+'">'+revealRoleOf(t)+'</div>'
+            + '<div class="tip">只告诉机械狼：'+esc(t.name)+' 的身份是「'+revealRoleOf(t)+'」。</div>'
+          : '<div class="tip">只有机械狼一个人睁眼。这一步排在狼人刀人之后（先刀后验）。</div>',
+        '<div class="btn-row"><button class="btn" data-act="mech-seer-clear" '+(n.mechSeer?'':'disabled')+'>清除重选</button></div>');
+    }
+
+    if(st.wake === 'mechPoison'){
+      html += box('机械狼 · 毒杀（穿盾）',
+        n.mechPoison ? chip(n.mechPoison) : empty('点击座位选择今晚要毒的人'),
+        '<div class="tip">毒药无视守卫，整局只有这一瓶。用掉后本局不再出现这个环节。</div>',
+        '<div class="btn-row"><button class="btn" data-act="mech-poison-clear" '+(n.mechPoison?'':'disabled')+'>本夜不用毒</button></div>');
+    }
+
+    if(st.wake === 'mechGuard'){
+      html += box('机械狼 · 守护（整局一次）',
+        n.mechGuard ? chip(n.mechGuard) : empty('点击座位选择今晚要守的人'),
+        '<div class="tip">被守的人当晚免疫所有夜间伤害，刀和毒都杀不死。整局只能发动一次。</div>',
+        '<div class="btn-row"><button class="btn" data-act="mech-guard-clear" '+(n.mechGuard?'':'disabled')+'>不守护</button></div>');
+    }
+
+    if(st.wake === 'mechKill'){
+      html += box('机械狼 · 先行击杀',
+        n.mechKill ? chip(n.mechKill) : empty('点击座位选择要单独击杀的人'),
+        '<div class="tip">这一刀在狼队合议之前单独结算，也可以空刀。</div>',
+        '<div class="btn-row"><button class="btn" data-act="mech-kill-clear" '+(n.mechKill?'':'disabled')+'>空刀</button></div>');
+    }
   }
 
   if(st.role === 'beauty'){
@@ -1539,8 +1694,8 @@ function buildActionHTML(st){
       html += empty('点击任意座位，查看 ta 的真实身份');
     }else{
       const p = getP(target);
-      html += chip(target)
-        + '<div class="verdict ' + (ROLES[p.role].camp==='wolf'?'wolf':'good') + '">' + ROLES[p.role].name + '</div>'
+      html += chip(target, null, revealRoleOf(p))
+        + '<div class="verdict ' + (ROLES[p.role].camp==='wolf'?'wolf':'good') + '">' + revealRoleOf(p) + '</div>'
         + '<div class="tip">悄悄告知 '+esc(p.name)+' 的真实身份'+(p.alive?'（在场存活）':'（已出局）')+'，别让其他人听到。</div>';
     }
     html += '<div class="btn-row"><button class="btn" data-act="medium-clear">清除重选</button></div>';
@@ -1714,6 +1869,11 @@ function stepMeta(s){
   if(s.role === 'witch') return n.save ? '解药' : (n.poison ? '毒 ' + fmtSeat(n.poison) : '—');
   if(s.role === 'seer') return n.seer ? fmtSeat(n.seer) : '—';
   if(s.wake === 'medium') return n.medium ? fmtSeat(n.medium) : '—';
+  if(s.wake === 'learn') return (state.mech && state.mech.taught) ? '已学' : (n.mechLearn ? fmtSeat(n.mechLearn) : '—');
+  if(s.wake === 'mechSeer') return n.mechSeer ? fmtSeat(n.mechSeer) : '—';
+  if(s.wake === 'mechPoison') return n.mechPoison ? '毒 ' + fmtSeat(n.mechPoison) : '—';
+  if(s.wake === 'mechGuard') return n.mechGuard ? fmtSeat(n.mechGuard) : '—';
+  if(s.wake === 'mechKill') return n.mechKill ? fmtSeat(n.mechKill) : '—';
   if(s.wake === 'pick') return (n.custom && n.custom[s.role]) ? fmtSeat(n.custom[s.role]) : '—';
   if(s.role === 'hunter') return '—';
   return '';
@@ -1749,6 +1909,7 @@ function renderBoard(){
     if(!hidden){
       const nightOpen = state.phase === 'night' && state.stepKey !== 'dawn';
       if(p.seat === state.night.guard && nightOpen) seats.push('<span class="tag guarded">守护</span>');
+      if(p.seat === state.night.mechGuard && nightOpen) seats.push('<span class="tag guarded">守护</span>');
       if(p.tags.includes('novote')) seats.push('<span class="tag voteless">无票权</span>');
       if(p.seat === state.night.poison && nightOpen) seats.push('<span class="tag poisoned">中毒</span>');
     }
@@ -1779,6 +1940,11 @@ function isTargetSeat(seat){
   if(m === 'charm')  return n.charm === seat;
   if(m === 'copy')   return n.copy === seat;
   if(m === 'medium') return n.medium === seat;
+  if(m === 'learn')      return n.mechLearn === seat;
+  if(m === 'mechSeer')   return n.mechSeer === seat;
+  if(m === 'mechPoison') return n.mechPoison === seat;
+  if(m === 'mechGuard')  return n.mechGuard === seat;
+  if(m === 'mechKill')   return n.mechKill === seat;
   if(m === 'pick'){
     const r = curStep().role;
     return !!(n.custom && n.custom[r] === seat);
@@ -1831,17 +1997,58 @@ function onSeatClick(seat){
       if(state.night.charm) log('狼美人魅惑 '+fmtSeat(seat)+' 号 '+p.name);
       renderAll();
       break;
-    case 'copy':
+    case 'learn': {
+      const mw = state.players.find(x=>x.role === 'mechWolf');
+      if(state.mech && state.mech.taught){ toast('本局已经学过，不能再学'); return; }
+      if(!p.alive){ toast('只能学习还活着的玩家'); return; }
+      if(mw && mw.seat === seat){ toast('机械狼不能学习自己'); return; }
       snap();
-      state.night.copy = (state.night.copy === seat ? null : seat);
-      if(state.night.copy) log('机械狼复制目标：'+fmtSeat(seat)+' 号 '+p.name+'（'+ROLES[p.role].name+'）');
+      state.night.mechLearn = (state.night.mechLearn === seat ? null : seat);
+      if(state.night.mechLearn) log('机械狼选中 '+fmtSeat(seat)+' 号 '+p.name+'（'+ROLES[p.role].name+'），待确认学习');
       renderAll();
       break;
+    }
+    case 'mechSeer': {
+      const mw = state.players.find(x=>x.role === 'mechWolf');
+      if(mw && mw.seat === seat){ toast('机械狼不能查验自己'); return; }
+      snap();
+      state.night.mechSeer = seat;
+      log('机械狼（学通灵师）查验 '+fmtSeat(seat)+' 号 '+p.name+' → '+revealRoleOf(p), ROLES[p.role].camp==='wolf'?'danger':'ok');
+      renderAll();
+      break;
+    }
+    case 'mechPoison': {
+      const mw = state.players.find(x=>x.role === 'mechWolf');
+      if(!p.alive){ toast('只能毒还活着的玩家'); return; }
+      if(mw && mw.seat === seat){ toast('不能毒自己'); return; }
+      snap();
+      state.night.mechPoison = (state.night.mechPoison === seat ? null : seat);
+      if(state.night.mechPoison) log('机械狼（学女巫）毒杀目标：'+fmtSeat(seat)+' 号 '+p.name, 'danger');
+      renderAll();
+      break;
+    }
+    case 'mechGuard':
+      if(!p.alive){ toast('只能守护还活着的玩家'); return; }
+      snap();
+      state.night.mechGuard = (state.night.mechGuard === seat ? null : seat);
+      if(state.night.mechGuard) log('机械狼（学守卫）守护 '+fmtSeat(seat)+' 号 '+p.name);
+      renderAll();
+      break;
+    case 'mechKill': {
+      const mw = state.players.find(x=>x.role === 'mechWolf');
+      if(!p.alive){ toast('只能击杀还活着的玩家'); return; }
+      if(mw && mw.seat === seat){ toast('不能击杀自己'); return; }
+      snap();
+      state.night.mechKill = (state.night.mechKill === seat ? null : seat);
+      if(state.night.mechKill) log('机械狼（学狼人）先行击杀 '+fmtSeat(seat)+' 号 '+p.name);
+      renderAll();
+      break;
+    }
     case 'medium':
       snap();
       state.night.medium = (state.night.medium === seat ? null : seat);
       if(state.night.medium){
-        log('通灵师查验 '+fmtSeat(seat)+' 号 '+p.name+'（'+(p.alive?'存活':'已出局')+'）→ '+ROLES[p.role].name,
+        log('通灵师查验 '+fmtSeat(seat)+' 号 '+p.name+'（'+(p.alive?'存活':'已出局')+'）→ '+revealRoleOf(p),
             ROLES[p.role].camp==='wolf'?'danger':'ok');
       }
       renderAll();
@@ -2030,12 +2237,40 @@ function handleAction(act){
     case 'charm-clear':
       snap(); state.night.charm = null; state.charmLast = null; renderAll();
       break;
-    case 'copy-pick':
-      state.pickMode = 'copy'; state.shotTarget = null; renderAll();
-      toast('请点击座位指定复制对象');
+    case 'mech-learn-confirm': {
+      const mech = state.mech || {};
+      const target = state.night.mechLearn;
+      if(!target){ toast('还没有选择学习对象'); return; }
+      if(mech.taught){ toast('本局已经学过，不能再学'); return; }
+      const p = getP(target);
+      if(!p){ return; }
+      snap();
+      mech.taught = true;
+      mech.learned = p.role;
+      mech.day = state.day;
+      mech.target = target;
+      const sk = MECH_SKILL[p.role];
+      log('机械狼学习 '+fmtSeat(target)+' 号 '+p.name+'（'+ROLES[p.role].name+'）→ 学会「'+sk.label+'」：'+sk.text+'，'+sk.timing+'生效', 'danger');
+      state.night.mechLearn = null;
+      state.pickMode = null;
+      renderAll();
+      toast('已学会「'+sk.label+'」，本局不能再学');
       break;
-    case 'copy-clear':
-      snap(); state.night.copy = null; renderAll();
+    }
+    case 'mech-learn-clear':
+      snap(); state.night.mechLearn = null; renderAll();
+      break;
+    case 'mech-seer-clear':
+      snap(); state.night.mechSeer = null; renderAll();
+      break;
+    case 'mech-poison-clear':
+      snap(); state.night.mechPoison = null; renderAll();
+      break;
+    case 'mech-guard-clear':
+      snap(); state.night.mechGuard = null; renderAll();
+      break;
+    case 'mech-kill-clear':
+      snap(); state.night.mechKill = null; renderAll();
       break;
     case 'medium-clear':
       snap(); state.night.medium = null; renderAll();
@@ -2731,7 +2966,16 @@ const RULE_TABS = [
     <h4>黑狼王</h4>
     <p>狼队成员。<strong>出局时可以带走一名玩家</strong>：被投票放逐、被猎人/白狼王/骑士带走、被狼刀时都触发；<strong>被女巫毒杀时不触发</strong>。工具会像猎人一样弹出「带走谁」面板。</p>
     <h4>机械狼</h4>
-    <p>狼队成员，夜里与狼队一起睁眼。可以指认一名玩家<strong>复制其技能</strong>。不同平台的具体结算差异很大（有的永久生效、有的只当晚有效），本工具负责记录目标并写进日志，<strong>实际效果由上帝按你们村规口头处理</strong>。</p>
+    <p><strong>主动技：一场只有一次机会</strong>，可以在任一夜晚学习一名玩家的技能，学完不能换。学会后按学习对象生效：</p>
+    <ul>
+      <li><strong>通灵师</strong>：下一夜起，每晚可查验一名玩家的具体身份（先刀后验）。</li>
+      <li><strong>女巫</strong>：下一夜起，可在之后任一夜晚毒杀一人，<strong>无视守卫</strong>，整局一瓶。</li>
+      <li><strong>猎人</strong>：当晚起，出局时可带走一人（与狼王一致，<strong>被毒不触发</strong>）。</li>
+      <li><strong>守卫</strong>：下一夜起，可守护一人一次，被守者当晚<strong>免疫所有夜间伤害</strong>，刀和毒都杀不死。</li>
+      <li><strong>狼人</strong>：下一夜起，每夜在狼人合议前先单独击杀一人，再进狼窝合议。</li>
+      <li><strong>平民</strong>：没有特殊技能。</li>
+    </ul>
+    <p><strong>被动技</strong>：学过人之后被通灵师查验，看到的是<strong>被学对象的身份</strong>；还没学人时被查验，显示为<strong>「大狼」</strong>。</p>
     <h4>狼美人</h4>
     <p>狼队成员，夜里与狼队一起睁眼，并额外<strong>魅惑一名玩家</strong>。狼美人自己出局时，<strong>被魅惑者一同出局</strong>（不受任何保护影响）。魅惑不改变对方的阵营，也不影响其投票。工具会在狼美人出局时自动连锁结算。</p>
     <h4>村民</h4>
@@ -3448,8 +3692,13 @@ function boot(){
     state = saved;
     if(!state.undos) state.undos = [];
     if(!state.night) state.night = {kill:null,save:false,poison:null,guard:null,guardPrev:null,seer:null,
-                                    charm:null,copy:null,medium:null};
-    ['charm','copy','medium'].forEach(k=>{ if(state.night[k] === undefined) state.night[k] = null; });
+                                    charm:null,copy:null,medium:null,
+                                    mechLearn:null,mechSeer:null,mechPoison:null,mechGuard:null,mechKill:null};
+    ['charm','copy','medium','mechLearn','mechSeer','mechPoison','mechGuard','mechKill'].forEach(k=>{ if(state.night[k] === undefined) state.night[k] = null; });
+    if(!state.mech) state.mech = {taught:false, learned:null, day:0, target:null, poisonUsed:false, guardUsed:false};
+    if(state.mech.taught === undefined) state.mech.taught = false;
+    if(state.mech.poisonUsed === undefined) state.mech.poisonUsed = false;
+    if(state.mech.guardUsed === undefined) state.mech.guardUsed = false;
     if(state.night.custom === undefined) state.night.custom = {};
     if(!state.witch) state.witch = {saveUsed:false, poisonUsed:false};
     if(!state.votes) state.votes = {};
