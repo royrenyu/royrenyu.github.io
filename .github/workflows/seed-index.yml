@@ -29,23 +29,18 @@ jobs:
       - name: Sanitize
         run: python3 .github/sanitize.py
 
-      - name: Report
-        run: |
-          echo "--- result ---"
-          wc -c index.html
-          echo "title hits: $(grep -c 狼人杀 index.html || true)"
-          echo "slardar hits: $(grep -c Slardar index.html || true)"
-          echo "tail iframe hits: $(grep -c miaoda-html-comment index.html || true)"
-
       - name: Commit if changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           rm -f page.raw.html
           git add index.html
+          SIZE=$(wc -c < index.html)
+          CHARS=$(python3 -c "print(len(open('index.html', encoding='utf-8').read()))")
+          echo "size=$SIZE chars=$CHARS"
           if git diff --cached --quiet; then
             echo "no change"
           else
-            git commit -m "seed: sync clean index.html"
+            git commit -m "seed: clean index (bytes=$SIZE chars=$CHARS)"
             git push
           fi
