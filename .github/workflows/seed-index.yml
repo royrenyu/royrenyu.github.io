@@ -1,0 +1,39 @@
+name: Seed index.html
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'index.html'
+
+permissions:
+  contents: write
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Pull page source
+        run: |
+          curl -fsSL "https://dpaste.com/64Q8C9XXQ.txt" -o index.html
+          bytes=$(wc -c < index.html)
+          echo "downloaded bytes: $bytes"
+          test "$bytes" -gt 100000
+          grep -q "狼人杀" index.html
+          test "$(tail -c 40 index.html | tr -d '\n')" != ""
+
+      - name: Commit if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          if git diff --cached --quiet; then
+            echo "no change"
+          else
+            git commit -m "seed: add index.html"
+            git push
+          fi
