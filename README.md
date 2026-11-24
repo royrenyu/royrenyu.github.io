@@ -11,8 +11,10 @@ https://royrenyu.github.io/
 - **上帝端**：直接打开上面链接（不带 `#room=` 参数）即为控制台，负责流程、计时、结算。
 - **玩家端**：上帝在控制台点「在线选号」建房间，复制生成的 `#room=xxx` 链接发到群里；每人点进来选自己的座位号，等上帝开局发牌后在手机上翻牌看身份。
 
+<img src="./assets/usage.png" alt="控制台使用说明" width="460">
+
 ## 说明
 
 - 页面本身是纯静态单文件，选号房间数据走公共临时云存储，需要联网。
 - `index.html` 由 GitHub Actions 从源地址同步生成，改内容请改源文件后重跑 workflow（Actions → Seed index.html → Run workflow）。
-
+- 上方使用说明图由 Actions 下载到 `assets/usage.png`，同样在重跑时同步。
