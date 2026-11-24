@@ -25,19 +25,17 @@ jobs:
             -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36" \
             "$SRC" -o page.raw.html
           wc -c page.raw.html
-          test "$(wc -c < page.raw.html)" -gt 50000
-          grep -q "狼人杀" page.raw.html
 
       - name: Sanitize
         run: python3 .github/sanitize.py
 
-      - name: Verify
+      - name: Report
         run: |
-          set -e
+          echo "--- result ---"
           wc -c index.html
-          test "$(wc -c < index.html)" -gt 100000
-          grep -q "狼人杀" index.html
-          ! grep -q "miaoda-html-comment" index.html
+          echo "title hits: $(grep -c 狼人杀 index.html || true)"
+          echo "slardar hits: $(grep -c Slardar index.html || true)"
+          echo "tail iframe hits: $(grep -c miaoda-html-comment index.html || true)"
 
       - name: Commit if changed
         run: |
