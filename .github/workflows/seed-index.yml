@@ -19,21 +19,37 @@ jobs:
 
       - name: Pull page source
         run: |
-          curl -fsSL "https://dpaste.com/64Q8C9XXQ.txt" -o index.html
-          bytes=$(wc -c < index.html)
-          echo "downloaded bytes: $bytes"
-          test "$bytes" -gt 100000
+          set -e
+          SRC="https://4mk1gaxbp8n2r.doubao.link/app/app_17jnv90kh30"
+          curl -fsSL --retry 3 --max-time 90 \
+            -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36" \
+            "$SRC" -o page.raw.html
+          bytes=$(wc -c < page.raw.html)
+          echo "raw bytes: $bytes"
+          test "$bytes" -gt 50000
+          grep -q "狼人杀" page.raw.html
+          python3 - <<'PY'
+          import re
+          s = open('page.raw.html', encoding='utf-8', errors='replace').read()
+          s = re.sub(r'\s+data-inspector-id="[^"]*"', '', s)
+          s = re.sub(r'\s+data-src-ver="[^"]*"', '', s)
+          s = re.sub(r'<base href="[^"]*">', '', s)
+          s = re.sub(r'<script[^>]+ibytedapm[^>]*>', '<script>', s)
+          open('index.html', 'w', encoding='utf-8').write(s)
+          print('cleaned chars:', len(s))
+          PY
           grep -q "狼人杀" index.html
-          test "$(tail -c 40 index.html | tr -d '\n')" != ""
+          grep -q "</html>" index.html
 
       - name: Commit if changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rm -f page.raw.html
           git add index.html
           if git diff --cached --quiet; then
             echo "no change"
           else
-            git commit -m "seed: add index.html"
+            git commit -m "seed: sync index.html"
             git push
           fi
