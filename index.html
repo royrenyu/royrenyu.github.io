@@ -3266,11 +3266,19 @@ function clientId(){
   }
   return c;
 }
+function cloudSleep(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
 async function cloudFetch(url, opt){
   const ac = new AbortController();
-  const tm = setTimeout(()=>ac.abort(), 10000);
-  try{ return await fetch(url, Object.assign({}, opt, {signal: ac.signal})); }
-  finally{ clearTimeout(tm); }
+  const tm = setTimeout(()=>ac.abort(), 20000);
+  try{
+    return await fetch(url, Object.assign({}, opt, {signal: ac.signal}));
+  }catch(e){
+    const m = (e && e.message) || '';
+    if((e && e.name === 'AbortError') || /abort/i.test(m)) throw new Error('网络超时');
+    throw new Error('网络连不上');
+  }finally{
+    clearTimeout(tm);
+  }
 }
 function parseLoose(text){
   const s = String(text).trim();
@@ -3285,29 +3293,53 @@ function parseLoose(text){
   try{ return JSON.parse(s.slice(start, end + 1)); }catch(e){ return null; }
 }
 async function cloudCreate(data){
-  const r = await cloudFetch(CLOUD_API, {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify(data)
-  });
-  if(!r.ok) throw new Error('HTTP ' + r.status);
-  const j = parseLoose(await r.text());
-  if(!j || !j.id) throw new Error('返回异常');
-  return j.id;
+  let last = null;
+  for(let i=0;i<3;i++){
+    try{
+      const r = await cloudFetch(CLOUD_API, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(data)
+      });
+      if(!r.ok) throw new Error('HTTP ' + r.status);
+      const j = parseLoose(await r.text());
+      if(!j || !j.id) throw new Error('返回异常');
+      return j.id;
+    }catch(e){ last = e; if(i < 2) await cloudSleep(500 * (i + 1)); }
+  }
+  throw last || new Error('创建失败');
 }
-async function cloudGet(id){
-  const r = await cloudFetch(CLOUD_API + '/' + id + '?r=' + Math.random().toString(36).slice(2), {cache:'no-store'});
-  if(!r.ok) throw new Error('HTTP ' + r.status);
-  const j = parseLoose(await r.text());
-  if(!j) throw new Error('数据读取失败');
-  return (j.data && typeof j.data === 'object') ? j.data : j;
+async function cloudGet(id, tries){
+  const n = Math.max(1, tries || 3);
+  let last = null;
+  for(let i=0;i<n;i++){
+    try{
+      const r = await cloudFetch(CLOUD_API + '/' + id + '?r=' + Math.random().toString(36).slice(2), {cache:'no-store'});
+      if(r.status === 404) throw new Error('房间不存在（可能已过期）');
+      if(!r.ok) throw new Error('HTTP ' + r.status);
+      const j = parseLoose(await r.text());
+      if(!j) throw new Error('数据读取失败');
+      return (j.data && typeof j.data === 'object') ? j.data : j;
+    }catch(e){
+      last = e;
+      if(/房间不存在/.test((e && e.message) || '')) break;
+      if(i < n - 1) await cloudSleep(400 * (i + 1));
+    }
+  }
+  throw last || new Error('网络异常');
 }
 async function cloudPut(id, data){
-  const r = await cloudFetch(CLOUD_API + '/' + id, {
-    method:'PUT', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify(data)
-  });
-  if(!r.ok) throw new Error('HTTP ' + r.status);
-  return true;
+  let last = null;
+  for(let i=0;i<3;i++){
+    try{
+      const r = await cloudFetch(CLOUD_API + '/' + id, {
+        method:'PUT', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(data)
+      });
+      if(!r.ok) throw new Error('HTTP ' + r.status);
+      return true;
+    }catch(e){ last = e; if(i < 2) await cloudSleep(400 * (i + 1)); }
+  }
+  throw last || new Error('保存失败');
 }
 function roomLink(id){
   let base = location.href.split('#')[0];
@@ -3363,11 +3395,15 @@ function startRoomPoll(){
   stopRoomPoll();
   roomPoll = setInterval(()=>{ if(!document.getElementById('roomBody')){ stopRoomPoll(); return; } refreshRoom(); }, 6000);
 }
+let roomOk = null, roomErr = '';
 async function refreshRoom(){
   if(!room || !room.id) return;
   try{
-    roomCache = await cloudGet(room.id);
-  }catch(e){ return; }
+    roomCache = await cloudGet(room.id, 2);
+    roomOk = true; roomErr = '';
+  }catch(e){
+    roomOk = false; roomErr = e.message || '网络问题';
+  }
   paintRoom();
 }
 
@@ -3413,10 +3449,18 @@ function paintRoom(){
   el.innerHTML = '<div class="rm-link"><input id="rmUrl" readonly value="' + esc(link) + '">'
     + '<button class="btn" id="rmCopy">复制链接</button></div>'
     + '<div class="rm-bar"><span class="rm-badge' + (locked ? ' lock' : '') + '">' + (locked ? '已锁定发牌' : '选号中') + '</span>'
+    + (roomOk === false
+        ? '<span class="rm-badge" style="background:rgba(217,88,78,.18);color:#f0b3ad">链接异常 · ' + esc(roomErr) + '</span>'
+        : (roomOk ? '<span class="rm-badge" style="background:rgba(96,180,120,.18);color:#a9dcb8">链接可用</span>' : ''))
     + '<span style="font-size:12px;color:var(--muted)">已选 ' + picked + ' / ' + total + ' 个号</span>'
     + '<span style="flex:1"></span>'
-    + '<button class="btn btn-sm" id="rmRef">刷新</button></div>'
+    + '<button class="btn btn-sm" id="rmRef">刷新</button>'
+    + '<button class="btn btn-sm" id="rmCheck">检查链接</button></div>'
+    + (roomOk === false
+        ? '<div class="rm-bar"><span style="font-size:12px;color:#f0b3ad">这个链接现在读不回来，玩家点进来就会停在「连不上房间」。点「重建房间」换一个新链接，重新发群。</span></div>'
+        : '')
     + '<div class="rm-bar"><button class="btn btn-primary" id="rmPush">同步当前身份到玩家手机</button>'
+    + (roomOk === false ? '<button class="btn" id="rmRebuild">重建房间</button>' : '')
     + '<button class="btn btn-sm" id="rmUnlock">解锁重选</button>'
     + '<button class="btn btn-sm btn-danger" id="rmDrop">解散房间</button></div>'
     + '<div class="rm-seats">' + cells + '</div>'
@@ -3430,6 +3474,13 @@ function paintRoom(){
     if(cp) cp.addEventListener('click', ()=>{ fallbackCopy(link); toast('链接已复制，去群里粘贴'); });
   const rf = el.querySelector('#rmRef');
     if(rf) rf.addEventListener('click', ()=>{ refreshRoom(); toast('已刷新'); });
+  const ck = el.querySelector('#rmCheck');
+    if(ck) ck.addEventListener('click', async ()=>{
+      await refreshRoom();
+      toast(roomOk ? '链接正常，玩家可以点进来' : ('链接读不回来：' + roomErr + '，建议重建房间'));
+    });
+  const rb = el.querySelector('#rmRebuild');
+    if(rb) rb.addEventListener('click', doCreateRoom);
   const ps = el.querySelector('#rmPush');
     if(ps) ps.addEventListener('click', ()=>pushIdentities(false));
   const un = el.querySelector('#rmUnlock');
@@ -3450,8 +3501,13 @@ async function doCreateRoom(){
     const id = await cloudCreate(data);
     writeRoom({ id, total, createdAt: Date.now() });
     roomCache = data;
-    toast('房间已创建');
+    roomOk = true; roomErr = '';
+    try{ await cloudGet(id, 2); }
+    catch(e){ roomOk = false; roomErr = e.message || '网络问题'; }
+    if(roomOk) toast('房间已创建，链接可用');
+    else toast('房间建好了但读不回来：' + roomErr + '，稍后点「检查链接」再试');
   }catch(e){
+    roomOk = false; roomErr = e.message || '网络问题';
     toast('创建失败：' + (e.message || '网络问题') + '，再点一次试试');
   }
   paintRoom();
@@ -3474,7 +3530,7 @@ async function doUnlockRoom(){
 /* ==================== 玩家端：手机选号 / 翻牌 ==================== */
 
 const CAMP_LABEL = { wolf:'狼人阵营', god:'神职阵营', vil:'平民阵营' };
-const P = { rid:null, data:null, err:'', mySeat:null, busy:false, name:'', revealed:false, timer:null };
+const P = { rid:null, data:null, err:'', mySeat:null, busy:false, name:'', revealed:false, timer:null, fails:0, fatal:false };
 
 function plEl(){ return document.getElementById('plWrap'); }
 
@@ -3513,9 +3569,9 @@ function startPlayerMode(){
 
 async function pPull(){
   try{
-    const d = await cloudGet(P.rid);
+    const d = await cloudGet(P.rid, 3);
     P.data = d;
-    P.err = '';
+    P.err = ''; P.fails = 0; P.fatal = false;
     if(P.mySeat){
       const s = (d.seats || {})[String(P.mySeat)];
       if(s && s.cid && s.cid !== clientId()){
@@ -3525,7 +3581,9 @@ async function pPull(){
       }
     }
   }catch(e){
-    P.err = e.message || '网络异常';
+    P.fails = (P.fails || 0) + 1;
+    P.fatal = /房间不存在/.test((e && e.message) || '');
+    P.err = (e && e.message) || '网络异常';
   }
 }
 
@@ -3534,11 +3592,12 @@ function pLoop(){
   P.timer = setInterval(async ()=>{
     if(!P.rid) return;
     if(P.data && P.data.locked && P.mySeat) return;
+    if(P.fatal && P.fails >= 6) return;
     const ae = document.activeElement;
     if(ae && ae.id === 'plName') return;
     await pPull();
     pPaint();
-  }, 7000);
+  }, 5000);
 }
 
 function pPaint(){
@@ -3551,10 +3610,17 @@ function pPaint(){
   }
 
   if(!P.data){
-    if(P.err){
+    if(P.err && (P.fatal || P.fails >= 4)){
       el.innerHTML = '<div class="pl-wait"><div class="pl-big">连不上房间</div>'
-        + '<div class="pl-sub">' + esc(P.err) + '<br>检查一下网络，或者再点一次。</div>'
+        + '<div class="pl-sub">' + esc(P.err)
+        + (P.fatal
+            ? '<br>这个房间已经失效了，让上帝重新发一个新链接。'
+            : '<br>已经自动重试了 ' + P.fails + ' 次。看一下手机网络，或者再点一次。')
+        + '</div>'
         + '<button class="pl-btn primary" data-repull="1" style="margin-top:24px">重试</button></div>';
+    }else if(P.err){
+      el.innerHTML = '<div class="pl-wait"><div class="ring"></div><div class="pl-big">正在重新连接…</div>'
+        + '<div class="pl-sub">' + esc(P.err) + '<br>网络有点慢，正在自动重试（第 ' + P.fails + ' 次），不用退出页面。</div></div>';
     }else{
       el.innerHTML = '<div class="pl-wait"><div class="ring"></div><div class="pl-big">正在进入房间…</div></div>';
     }
@@ -3593,7 +3659,7 @@ function waitHTML(){
     + '<div class="pl-big">你是 ' + seat + ' 号</div>'
     + '<div class="pl-sub">占号成功。等上帝统一下发身份后，这里会自动出现你的牌面。</div>'
     + '</div>'
-    + '<div class="pl-note">页面会每 7 秒自己检查一次，不用手动刷新。</div>'
+    + '<div class="pl-note">页面会每 5 秒自己检查一次，不用手动刷新。</div>'
     + '<button class="pl-btn ghost" data-repull="1">立即检查</button>'
     + '<button class="pl-btn ghost" id="plChange">换一个号</button>';
 }
