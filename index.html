@@ -884,15 +884,21 @@ const BOARDS = {
   six:    {name:'6人新手局',      total:6,  wolves:['wolf','wolf'],        gods:['seer','witch']}
 };
 
+function cfgExtraCount(cfg){
+  return (cfg.extra || []).reduce((sum, item) => {
+    return sum + ((item.name || '').trim() ? Math.max(0, +item.count || 1) : 0);
+  }, 0);
+}
 function cfgVillagers(cfg){
-  return cfg.total - cfg.wolves.length - cfg.gods.length;
+  return cfg.total - cfg.wolves.length - cfg.gods.length - cfgExtraCount(cfg);
 }
 function cfgDesc(cfg){
   const w = cfg.wolves.filter(k=>k!=='wolf').length;
   const wtxt = cfg.wolves.length + '狼' + (w ? '（含 '+cfg.wolves.filter(k=>k!=='wolf').map(k=>ROLES[k].name).join('/')+'）' : '');
   const gtxt = cfg.gods.map(k=>ROLES[k].name).join('/');
   const v = cfgVillagers(cfg);
-  return wtxt + ' · ' + (gtxt || '无神') + ' · ' + v + '民';
+  const xtxt = cfgExtraCount(cfg) ? ' · 自定义'+cfgExtraCount(cfg) : '';
+  return wtxt + ' · ' + (gtxt || '无神') + xtxt + ' · ' + v + '民';
 }
 function boardCfg(key){
   const b = BOARDS[key] || BOARDS.std12;
@@ -911,8 +917,9 @@ function registerCustomRoles(defs){
       camp: d.camp === 'wolf' ? 'wolf' : (d.camp === 'vil' ? 'vil' : 'god'),
       color: d.color || CUSTOM_PALETTE[i % CUSTOM_PALETTE.length],
       order: d.wake ? (d.order || 5.5) : null,
-      wake: d.wake || null,
-      brief: d.brief || '自定义身份'
+      wake: d.wake === true ? 'pick' : (d.wake || null),
+      brief: d.brief || '自定义身份',
+      custom: true
     };
     ROLE_COLOR[key] = ROLE_DEFS[key].color;
   });
@@ -931,6 +938,14 @@ function fmtSeat(n){ return String(n).padStart(2,'0'); }
 function getP(seat){ return state.players.find(p=>p.seat===seat); }
 function aliveRole(role){ return state.players.some(p=>p.alive && p.role===role); }
 function aliveGhost(){ return state.players.filter(p=>p.alive); }
+function recomputeCensus(){
+  const census = {wolf:0, god:0, vil:0};
+  state.players.forEach(p=>{
+    const camp = (ROLES[p.role] && ROLES[p.role].camp) || 'vil';
+    census[camp === 'wolf' ? 'wolf' : (camp === 'god' ? 'god' : 'vil')] += 1;
+  });
+  state.census = census;
+}
 
 function createState(cfgOrKey, names){
   let cfg;
@@ -939,7 +954,10 @@ function createState(cfgOrKey, names){
   if(cfg.extra && cfg.extra.length) registerCustomRoles(cfg.extra);
 
   const pool = cfg.wolves.concat(cfg.gods);
-  (cfg.extra || []).forEach(x=>{ for(let i=0;i<(x.count||1);i++) pool.push(x.key); });
+  (cfg.extra || []).forEach(x=>{ for(let i=0;i<Math.max(1, +x.count || 1);i++) pool.push(x.key); });
+  if(pool.length > cfg.total){
+    throw new Error('身份总数 '+pool.length+' 超过设置人数 '+cfg.total+'，请减少自定义身份或调大总人数');
+  }
   const vil = Math.max(0, cfg.total - pool.length);
   for(let i=0;i<vil;i++) pool.push('villager');
 
@@ -981,9 +999,14 @@ function createState(cfgOrKey, names){
     boomUsed: false,
     duelUsed: false,
     votes: {},
+    voteRecords: [],
+    voteVoter: null,
+    voteCandidates: null,
+    voteRound: 1,
     logs: [],
     identityHidden: false,
     pendingShot: null,
+    shotQueue: [],
     shotTarget: null,
     speakPointer: null,
     win: null,
@@ -991,6 +1014,8 @@ function createState(cfgOrKey, names){
     dawnResolved: false,
     exileResolved: false,
     screenMode: false,
+    advanceToNightAfterShots: false,
+    schemaVersion: 2,
     undos: []
   };
 }
@@ -1011,6 +1036,18 @@ function load(){
     s.undos = [];
     return s;
   }catch(e){ return null; }
+}
+function isValidSavedState(saved){
+  if(!saved || typeof saved !== 'object') return false;
+  if(!Array.isArray(saved.players) || saved.players.length < 2) return false;
+  const seats = new Set();
+  for(const player of saved.players){
+    if(!player || !Number.isInteger(player.seat) || seats.has(player.seat)) return false;
+    if(!player.role || !ROLES[player.role]) return false;
+    if(typeof player.alive !== 'boolean') return false;
+    seats.add(player.seat);
+  }
+  return ['night','day'].includes(saved.phase) && Number.isInteger(saved.day) && saved.day >= 1;
 }
 function snap(){
   try{
@@ -1039,11 +1076,23 @@ function pickOf(wake){
    机械狼的学习、狼美人魅惑各自单独睁眼 */
 function nightActors(){
   const found = {};
+  const customActors = [];
   state.players.forEach(p=>{
     if(!p.alive) return;
     const d = ROLES[p.role];
     if(!d || d.order == null || !d.wake) return;
-    found[p.role] = true;
+    if(d.custom){
+      customActors.push({
+        role: p.role,
+        actorSeat: p.seat,
+        order: d.order,
+        wake: d.wake,
+        camp: d.camp,
+        key: 'r_' + p.role + '_' + p.seat
+      });
+    }else{
+      found[p.role] = true;
+    }
   });
   const list = Object.keys(found)
     .map(r=>({role:r, order:ROLES[r].order, wake:ROLES[r].wake, camp:ROLES[r].camp}))
@@ -1051,7 +1100,7 @@ function nightActors(){
 
   const out = [];
   // 只要还有狼存活就开「狼人合议刀人」，机械狼/狼美人也一起参与刀人
-  if(list.some(a=>a.camp === 'wolf')){
+  if(list.some(a=>a.camp === 'wolf') || customActors.some(a=>a.camp === 'wolf')){
     out.push({role:'wolf', order:2, wake:'kill'});
   }
 
@@ -1084,7 +1133,12 @@ function nightActors(){
     if(a.role === 'mechWolf') return;                   // 机械狼环节在上面单独生成
     out.push({role:a.role, order:a.order, wake:a.wake});
   });
+  customActors.forEach(a=>out.push(a));
   return out.sort((a,b)=>a.order-b.order);
+}
+
+function customPickKey(step){
+  return step && (step.actorSeat || step.role);
 }
 
 function nightStepFor(a){
@@ -1190,10 +1244,11 @@ function nightStepFor(a){
 
     case 'pick':
     default:
-      title = nm + '请睁眼';
-      quote = nm + '请睁眼。请选择今晚要指定的目标。';
+      title = nm + '请睁眼' + (a.actorSeat ? ' · ' + fmtSeat(a.actorSeat) + '号' : '');
+      quote = nm + '请睁眼。请选择今晚要指定的目标。' + (a.actorSeat ? '（' + fmtSeat(a.actorSeat) + '号身份）' : '');
       tip = '点选座位记录目标；' + (d.brief || '按你们的约定结算。');
-      return {key:'r_'+a.role, role:a.role, pick:'pick', wake:'pick', title, screen:title, quote, tip};
+      return {key:a.key || ('r_'+a.role), role:a.role, actorSeat:a.actorSeat || null,
+        pick:'pick', wake:'pick', title, screen:title, quote, tip};
   }
 }
 
@@ -1250,14 +1305,26 @@ function defaultPick(key){
 }
 
 function setStep(key){
+  if(state.win){ toast('本局已经结束，不能再修改流程'); return; }
+  const list = steps();
+  const currentIndex = list.findIndex(step => step.key === state.stepKey);
+  const targetIndex = list.findIndex(step => step.key === key);
+  if(targetIndex >= 0 && currentIndex >= 0 && targetIndex < currentIndex &&
+      ((state.stepKey === 'dawn' && state.dawnResolved) ||
+       (state.stepKey === 'exile' && state.exileResolved))){
+    toast('该阶段已经结算，不能倒退修改；如需修正请使用撤销或座位菜单');
+    return;
+  }
   state.stepKey = key;
-  const cur = steps().find(s=>s.key===key);
+  const cur = list.find(s=>s.key===key);
   state.pickMode = (cur && cur.pick) ? cur.pick : null;
   state.shotTarget = null;
   renderAll();
 }
 
 function goNext(){
+  if(state.win){ toast('本局已经结束，请先复盘或重开'); return; }
+  if(hasPendingShot()){ toast('请先结算带走技能'); return; }
   const list = steps();
   let i = list.findIndex(s=>s.key===state.stepKey);
   if(i < 0) i = 0;
@@ -1265,6 +1332,8 @@ function goNext(){
 
   if(cur.key === 'dawn' && !state.dawnResolved){ resolveDawn(); }
   if(cur.key === 'exile' && !state.exileResolved){ doExile(); }
+  if(cur.key === 'dawn' && !state.dawnResolved) return;
+  if(cur.key === 'exile' && !state.exileResolved) return;
 
   if(i < list.length - 1){
     setStep(list[i+1].key);
@@ -1277,6 +1346,10 @@ function goNext(){
     state.pickMode = null;
     state.speakPointer = null;
     state.votes = {};
+    state.voteRecords = [];
+    state.voteVoter = null;
+    state.voteCandidates = null;
+    state.voteRound = 1;
     const dList = steps();
     state.stepKey = (dList[0] || {key:'debate'}).key;
     renderAll();
@@ -1286,6 +1359,7 @@ function goNext(){
 }
 
 function goPrev(){
+  if(state.win){ toast('本局已经结束，不能再修改流程'); return; }
   const list = steps();
   let i = list.findIndex(s=>s.key===state.stepKey);
   if(i > 0){ setStep(list[i-1].key); return; }
@@ -1293,6 +1367,8 @@ function goPrev(){
 }
 
 function startNewNight(){
+  if(state.win){ toast('本局已经结束，不能再进入下一夜'); return; }
+  if(hasPendingShot()){ toast('请先结算带走技能'); return; }
   snap();
   const prevGuard = state.night.guard;
   const prevCharm = state.night.charm;
@@ -1305,26 +1381,44 @@ function startNewNight(){
                  mechLearn:null, mechSeer:null, mechPoison:null, mechGuard:null, mechKill:null};
   state.charmPrev = prevCharm || null;
   state.votes = {};
+  state.voteRecords = [];
+  state.voteVoter = null;
+  state.voteCandidates = null;
+  state.voteRound = 1;
   state.speakPointer = null;
   state.dawnResolved = false;
   state.exileResolved = false;
   state.shotTarget = null;
-  state.win = null;
+  state.advanceToNightAfterShots = false;
   renderAll();
   toast('第 ' + state.day + ' 夜开始');
 }
 
 /* ==================== 死亡 / 技能 ==================== */
 /* 需要"带走一人"的技能排队，避免狼美人连锁时互相覆盖 */
+function hasPendingShot(){
+  return !!(state.pendingShot || (state.shotQueue && state.shotQueue.length));
+}
 function requestShot(seat, type){
+  state.shotQueue = state.shotQueue || [];
   if(!state.pendingShot){ state.pendingShot = {seat, type}; }
-  else { state.shotQueue = state.shotQueue || []; state.shotQueue.push({seat, type}); }
+  else { state.shotQueue.push({seat, type}); }
 }
 function nextShot(){
   state.pendingShot = null;
   state.shotTarget = null;
   if(state.shotQueue && state.shotQueue.length){
     state.pendingShot = state.shotQueue.shift();
+  }
+}
+function finishShotSettlement(){
+  if(hasPendingShot()){ renderAll(); return; }
+  updateWin();
+  if(!state.win && state.advanceToNightAfterShots){
+    state.advanceToNightAfterShots = false;
+    startNewNight();
+  }else{
+    renderAll();
   }
 }
 function shotHolderText(type){
@@ -1334,65 +1428,95 @@ function shotHolderText(type){
   return '猎人';
 }
 
-function killSeat(seat, cause){
+function normalizeCauses(cause){
+  const list = Array.isArray(cause) ? cause : [cause];
+  const valid = list.filter(x => x && CAUSE_LABEL[x]);
+  return Array.from(new Set(valid.length ? valid : ['other']));
+}
+function primaryCause(causes){
+  const priority = ['poison','beauty','vote','duel','boom','shot','pierce','wolf','other'];
+  return priority.find(cause => causes.includes(cause)) || causes[0] || 'other';
+}
+
+function killSeat(seat, cause, options){
   const p = getP(seat);
   if(!p || !p.alive) return false;
-  if(p.role === 'idiot' && cause === 'vote' && !p.tags.includes('flipped')){
+  options = options || {};
+  const causes = normalizeCauses(cause);
+  const primary = primaryCause(causes);
+  if(p.role === 'idiot' && causes.includes('vote') && !p.tags.includes('flipped')){
     p.tags.push('flipped','novote');
     log('白痴 '+fmtSeat(seat)+' 号 '+p.name+' 被投出，翻牌免死，本局失去投票权', 'ok');
     toast('白痴翻牌免死，仍留在场上（无投票权）');
     return true;
   }
   p.alive = false;
-  p.death = {day: state.day, phase: state.phase, cause};
-  log(fmtSeat(seat)+' 号 '+p.name+' 出局（'+CAUSE_LABEL[cause]+'）', 'danger');
+  p.death = {day: state.day, phase: state.phase, cause: primary, causes: causes.slice()};
+  log(fmtSeat(seat)+' 号 '+p.name+' 出局（'+causes.map(x=>CAUSE_LABEL[x]).join(' + ')+'）', 'danger');
 
   /* ---------- 死后技能 ---------- */
   if(p.role === 'hunter'){
-    if(cause === 'poison' || cause === 'beauty'){
-      log('猎人被' + (cause === 'poison' ? '毒杀' : '狼美人带走') + '，本局无法开枪', 'sys');
+    if(causes.includes('poison') || causes.includes('beauty')){
+      log('猎人因毒杀或狼美人连锁出局，本局无法开枪', 'sys');
     }else if(!p.tags.includes('shotUsed')){
       requestShot(seat, 'hunter');
       log('猎人技能触发：可开枪带走一名玩家', 'sys');
     }
   }
   if(p.role === 'blackWolf' && !p.tags.includes('shotUsed')){
-    if(cause === 'vote' || cause === 'shot' || cause === 'pierce' || cause === 'wolf' || cause === 'duel' || cause === 'boom'){
+    const blocked = causes.includes('poison') || causes.includes('beauty');
+    const triggers = causes.some(x => ['vote','shot','pierce','wolf','duel','boom'].includes(x));
+    if(!blocked && triggers){
       requestShot(seat, 'blackWolf');
       log('黑狼王技能触发：可带走一名玩家', 'sys');
+    }else if(blocked){
+      log('黑狼王因毒杀或狼美人连锁出局，本局无法发动技能', 'sys');
     }
   }
   /* 机械狼学到的猎人技能：出局时可带走一人，被毒不触发（与狼王一致） */
   if(p.role === 'mechWolf' && state.mech && state.mech.taught && state.mech.learned === 'hunter' && !p.tags.includes('shotUsed')){
-    if(cause === 'poison'){
-      log('机械狼被毒杀，学来的猎人技能无法发动', 'sys');
+    if(causes.includes('poison') || causes.includes('beauty')){
+      log('机械狼因毒杀或狼美人连锁出局，学来的猎人技能无法发动', 'sys');
     }else{
       requestShot(seat, 'mechHunter');
       log('机械狼（已学猎人）技能触发：可带走一名玩家', 'sys');
     }
   }
-  if(p.role === 'beauty' && cause !== 'beauty'){
+  if(p.role === 'beauty' && !causes.every(x => x === 'beauty')){
     const charm = state.night.charm || state.charmLast;
     if(charm){
       const t = getP(charm);
       if(t && t.alive){
         log('狼美人 '+fmtSeat(seat)+' 号出局，其魅惑对象 '+fmtSeat(charm)+' 号 '+t.name+' 一同出局', 'danger');
-        killSeat(charm, 'beauty');
+        killSeat(charm, 'beauty', {deferWin:true, render:false});
       }
     }
   }
 
-  updateWin();
-  renderAll();
+  if(!options.deferWin) updateWin();
+  if(options.render !== false) renderAll();
   return true;
 }
 
 function updateWin(){
-  if(state.win) return;
+  if(state.win) return true;
+  if(hasPendingShot()) return false;
+  const res = calculateWinner();
+  if(res){
+    state.win = res;
+    log('对局结束：' + res.text, res.winner==='good' ? 'ok' : 'danger');
+    toast(res.text);
+    soundWin();
+    renderAll();
+  }
+  return !!state.win;
+}
+function calculateWinner(){
+  if(hasPendingShot()) return null;
   const alive = aliveGhost();
-  const w = alive.filter(p=>ROLES[p.role].camp==='wolf').length;
-  const g = alive.filter(p=>ROLES[p.role].camp==='god').length;
-  const v = alive.filter(p=>ROLES[p.role].camp==='vil').length;
+  const w = alive.filter(p=>ROLES[p.role] && ROLES[p.role].camp==='wolf').length;
+  const g = alive.filter(p=>ROLES[p.role] && ROLES[p.role].camp==='god').length;
+  const v = alive.filter(p=>ROLES[p.role] && ROLES[p.role].camp==='vil').length;
   const c = state.census || {wolf:4, god:4, vil:4};
   let res = null;
   if(w === 0) res = {winner:'good', text:'好人阵营胜利'};
@@ -1402,28 +1526,25 @@ function updateWin(){
   }else{
     if(g === 0 && v === 0) res = {winner:'wolf', text:'狼人阵营胜利 · 屠城'};
   }
-  if(res){
-    state.win = res;
-    log('对局结束：' + res.text, res.winner==='good' ? 'ok' : 'danger');
-    toast(res.text);
-    soundWin();
-  }
+  return res;
 }
 
-/* 计算昨夜死亡名单（不改状态） */
+/* 计算昨夜死亡名单（不改状态）；同一目标保留全部伤害来源。 */
 function computeDeaths(){
-  const n = state.night, out = [], seen = {};
+  const n = state.night, bySeat = {};
   const add = (seat, cause)=>{
-    if(!seat || seen[seat]) return;
-    seen[seat] = true;
-    out.push({seat, cause});
+    if(!seat) return;
+    const target = getP(seat);
+    if(!target || !target.alive) return;
+    if(!bySeat[seat]) bySeat[seat] = {seat, causes:[]};
+    if(!bySeat[seat].causes.includes(cause)) bySeat[seat].causes.push(cause);
   };
   const mGuard = n.mechGuard;                          // 机械狼学守卫：被守者免疫所有夜间伤害
   if(n.kill && !n.save && n.guard !== n.kill && mGuard !== n.kill) add(n.kill, 'wolf');
   if(n.mechKill && mGuard !== n.mechKill) add(n.mechKill, 'pierce');      // 机械狼独立一刀，真守卫挡不住
   if(n.poison && mGuard !== n.poison) add(n.poison, 'poison');
   if(n.mechPoison && mGuard !== n.mechPoison) add(n.mechPoison, 'poison'); // 机械狼毒，穿盾
-  return out;
+  return Object.values(bySeat).map(x => Object.assign({}, x, {cause:primaryCause(x.causes)}));
 }
 
 function resolveDawn(){
@@ -1442,23 +1563,110 @@ function resolveDawn(){
   }
   const names = deaths.map(d=>fmtSeat(d.seat)+'号 '+getP(d.seat).name);
   log('公布昨夜死讯：' + names.join('、'), 'danger');
-  deaths.forEach(d=>killSeat(d.seat, d.cause));
+  deaths.forEach(d=>killSeat(d.seat, d.causes, {deferWin:true, render:false}));
+  updateWin();
   renderAll();
 }
 
+function eligibleVoters(){
+  return state.players.filter(p => p.alive && !p.tags.includes('novote'));
+}
+function recomputeVotes(){
+  const next = {};
+  (state.voteRecords || []).forEach(record => {
+    next[record.targetSeat] = (next[record.targetSeat] || 0) + 1;
+  });
+  state.votes = next;
+}
+function currentVoteVoter(){
+  const eligible = eligibleVoters();
+  const voted = new Set((state.voteRecords || []).map(record => record.voterSeat));
+  const selected = eligible.find(p => p.seat === state.voteVoter && !voted.has(p.seat));
+  if(selected) return selected;
+  state.voteVoter = (eligible.find(p => !voted.has(p.seat)) || {}).seat || null;
+  return getP(state.voteVoter);
+}
+function recordVote(targetSeat){
+  const voter = currentVoteVoter();
+  if(!voter){ toast('所有有票权玩家都已投票'); return; }
+  const target = getP(targetSeat);
+  if(!target || !target.alive){ toast('不能投给已出局玩家'); return; }
+  if(state.voteCandidates && !state.voteCandidates.includes(targetSeat)){
+    toast('PK 重投只能投给平票候选人'); return;
+  }
+  if((state.voteRecords || []).some(record => record.voterSeat === voter.seat)){
+    toast(fmtSeat(voter.seat) + ' 号已经投过票');
+    return;
+  }
+  snap();
+  state.voteRecords = state.voteRecords || [];
+  state.voteRecords.push({voterSeat: voter.seat, targetSeat, round: state.voteRound || 1});
+  state.voteVoter = null;
+  recomputeVotes();
+  log(fmtSeat(voter.seat)+' 号投给 '+fmtSeat(targetSeat)+' 号 '+target.name);
+  beep(520, .06, .12);
+  renderAll();
+}
+function removeLastVoteFor(targetSeat){
+  const records = state.voteRecords || [];
+  for(let i=records.length-1;i>=0;i--){
+    if(records[i].targetSeat === targetSeat){
+      const removed = records[i];
+      state.voteRecords.splice(i,1);
+      state.voteVoter = removed.voterSeat;
+      recomputeVotes();
+      renderAll();
+      return;
+    }
+  }
+}
 function doExile(){
   if(state.exileResolved) return;
-  const votes = state.votes;
-  const entries = Object.entries(votes).filter(([k,v])=>v>0).map(([k,v])=>({seat:+k, v}));
+  recomputeVotes();
+  const eligible = eligibleVoters();
+  const entries = Object.entries(state.votes).filter(([k,v])=>v>0).map(([k,v])=>({seat:+k, v}));
   if(!entries.length){ toast('还没有记录任何票数'); return; }
+  const deadTarget = entries.find(entry => {
+    const target = getP(entry.seat);
+    return !target || !target.alive;
+  });
+  if(deadTarget){
+    toast('有效票数中包含已出局玩家，请清除后重投');
+    return;
+  }
+  const validRecords = (state.voteRecords || []).filter(record => {
+    const voter = getP(record.voterSeat);
+    const target = getP(record.targetSeat);
+    return voter && voter.alive && !voter.tags.includes('novote') && target && target.alive;
+  });
+  if(!validRecords.length){
+    toast('票型中没有有效投票记录，请重投');
+    return;
+  }
+  const seenVoters = new Set();
+  const duplicateVoter = validRecords.find(record => {
+    if(seenVoters.has(record.voterSeat)) return true;
+    seenVoters.add(record.voterSeat);
+    return false;
+  });
+  if(duplicateVoter){
+    toast('同一玩家出现多张票，请先纠正票型');
+    return;
+  }
   const max = Math.max(...entries.map(e=>e.v));
   const top = entries.filter(e=>e.v===max);
   if(top.length > 1){
+    state.voteCandidates = top.map(entry => entry.seat);
     state.exileResolved = false;
-    log('投票平票：' + top.map(t=>fmtSeat(t.seat)+'号('+t.v+'票)').join('、') + '，需 PK 或重新投票', 'sys');
-    toast('平票！请 PK 发言后重投，或手动处理');
+    log('投票平票：' + top.map(t=>fmtSeat(t.seat)+'号('+t.v+'票)').join('、') + '，进入 PK 重投', 'sys');
+    toast('平票！可 PK 重投或宣布无人出局');
+    renderAll();
     return;
   }
+  if(validRecords.length < eligible.length){
+    log('提示：'+validRecords.length+' / '+eligible.length+' 名有票权玩家已投票', 'sys');
+  }
+  state.voteCandidates = null;
   state.exileResolved = true;
   log('投票结果：' + fmtSeat(top[0].seat) + ' 号以 ' + max + ' 票被放逐', 'danger');
   killSeat(top[0].seat, 'vote');
@@ -1597,7 +1805,11 @@ function buildActionHTML(st){
           '');
       }else{
         const cand = n.mechLearn ? getP(n.mechLearn) : null;
-        const sk = cand ? MECH_SKILL[cand.role] : null;
+        const sk = cand ? (MECH_SKILL[cand.role] || {
+          label: ROLES[cand.role].name,
+          text: '自定义身份效果，按主持人现场规则处理',
+          timing: '手动'
+        }) : null;
         html += box('机械狼 · 学习（本局仅一次）',
           cand ? chip(n.mechLearn) : empty('点击座位选择要学习的对象'),
           (cand && sk)
@@ -1716,12 +1928,13 @@ function buildActionHTML(st){
 
   if(st.wake === 'notice' && st.role !== 'hunter'){
     const d = ROLES[st.role];
-    html += '<div class="action-box"><div class="action-label">'+d.name+' · 唤醒</div>'
-      + '<div class="tip">'+(d.brief || '按你们的村规让 ta 行动')+'。本步骤只做唤醒与记录，结算由上帝口头处理。</div></div>';
+    html += '<div class="action-box"><div class="action-label">'+esc(d.name)+' · 唤醒</div>'
+      + '<div class="tip">'+esc(d.brief || '按你们的村规让 ta 行动')+'。本步骤只做唤醒与记录，结算由上帝口头处理。</div></div>';
   }
 
   if(st.wake === 'pick'){
-    const cur = n.custom ? n.custom[st.role] : null;
+    const key = customPickKey(st);
+    const cur = n.custom ? n.custom[key] : null;
     const d = ROLES[st.role];
     let verdict = '';
     if(d.wake === 'seer2' && cur){
@@ -1729,9 +1942,9 @@ function buildActionHTML(st){
       const isW = ROLES[tp.role].camp === 'wolf';
       verdict = '<div class="verdict ' + (isW?'wolf':'good') + '">' + (isW?'狼人':'好人') + '</div>';
     }
-    html += box(d.name + ' · 指定目标',
+    html += box(esc(d.name) + ' · 指定目标',
       (cur ? chip(cur) : empty('点击座位记录今晚的目标')) + verdict,
-      '<div class="tip">' + (d.brief || '按你们的村规结算效果。') + '</div>',
+      '<div class="tip">' + esc(d.brief || '按你们的村规结算效果。') + '</div>',
       '<div class="btn-row"><button class="btn" data-act="custom-pick">重新指定</button>'
       + '<button class="btn" data-act="custom-clear">清除</button></div>');
   }
@@ -1790,9 +2003,22 @@ function buildActionHTML(st){
 
   if(st.key === 'vote'){
     const list = Object.entries(state.votes).filter(([k,v])=>v>0).sort((a,b)=>b[1]-a[1]);
-    html += '<div class="action-box"><div class="action-label">计票（点击座位 +1）</div>';
+    const eligible = eligibleVoters();
+    const voted = new Set((state.voteRecords || []).map(r => r.voterSeat));
+    const active = currentVoteVoter();
+    html += '<div class="action-box"><div class="action-label">投票人与票型</div>';
+    html += '<div class="tip">先点投票人，再点目标座位；也可以按顺序直接点目标，系统会自动轮到下一位。</div>';
+    html += '<div class="role-chips">' + eligible.map(p =>
+      '<button class="role-chip' + (voted.has(p.seat) ? '' : (active && active.seat === p.seat ? ' on' : '')) + '" '
+      + 'data-act="vote-set-voter" data-voter="' + p.seat + '"' + (voted.has(p.seat) ? ' disabled' : '') + '>'
+      + fmtSeat(p.seat) + ' ' + esc(p.name) + (voted.has(p.seat) ? ' · 已投' : '') + '</button>'
+    ).join('') + '</div>';
+    if(state.voteCandidates && state.voteCandidates.length){
+      html += '<div class="hint-warn">PK 重投：本轮只能投给 ' + state.voteCandidates.map(fmtSeat).join('、') + ' 号。</div>';
+    }
+    html += '<div class="action-label" style="margin-top:10px">当前票型（点角标撤销该目标的最后一票）</div>';
     if(!list.length){
-      html += empty('还没有票，点击座位开始记录');
+      html += empty('还没有票，点击目标座位开始记录');
     }else{
       html += list.map(([k,v])=>chip(+k, null, v + ' 票')).join('');
     }
@@ -1808,13 +2034,16 @@ function buildActionHTML(st){
     if(!list.length){
       html += empty('本局没有记录票数');
     }else if(top.length > 1){
-      html += '<div class="hint-warn">平票：' + top.map(([k,v])=>fmtSeat(+k)+'号('+v+')').join('、') + '。请 PK 发言后重投，或手动点座位标记出局。</div>';
+      html += '<div class="hint-warn">平票：' + top.map(([k,v])=>fmtSeat(+k)+'号('+v+')').join('、') + '。可选择 PK 重投或宣布无人出局。</div>';
     }else{
       html += chip(+top[0][0], 'vote', max + ' 票');
       html += '<div class="tip">' + (state.exileResolved ? '已放逐。请让其发表遗言。' : '确认后将标记为出局。') + '</div>';
     }
     if(!state.exileResolved && top.length === 1){
       html += '<div class="btn-row"><button class="btn btn-danger" data-act="exile-confirm">确认放逐</button></div>';
+    }else if(!state.exileResolved && top.length > 1){
+      html += '<div class="btn-row"><button class="btn btn-primary" data-act="vote-pk">PK 重投</button>'
+        + '<button class="btn" data-act="vote-no-exile">无人出局</button></div>';
     }else if(state.exileResolved){
       html += '<div class="hint-ok">已放逐，等待遗言后进入夜晚。</div>';
     }
@@ -1833,7 +2062,7 @@ function chip(seat, cause, tail){
   return '<div class="chip-target"><span class="n">'+fmtSeat(seat)+'</span>'
     + '<span>'+esc(p.name)+'</span>'
     + '<span style="margin-left:auto;font-size:11.5px;color:var(--muted)">'
-    + (cause ? CAUSE_LABEL[cause] : (tail || ROLES[p.role].name)) + '</span></div>';
+    + (cause ? CAUSE_LABEL[cause] : esc(tail || ROLES[p.role].name)) + '</span></div>';
 }
 function empty(txt){ return '<div class="chip-empty">'+txt+'</div>'; }
 
@@ -1874,7 +2103,10 @@ function stepMeta(s){
   if(s.wake === 'mechPoison') return n.mechPoison ? '毒 ' + fmtSeat(n.mechPoison) : '—';
   if(s.wake === 'mechGuard') return n.mechGuard ? fmtSeat(n.mechGuard) : '—';
   if(s.wake === 'mechKill') return n.mechKill ? fmtSeat(n.mechKill) : '—';
-  if(s.wake === 'pick') return (n.custom && n.custom[s.role]) ? fmtSeat(n.custom[s.role]) : '—';
+  if(s.wake === 'pick'){
+    const key = customPickKey(s);
+    return (n.custom && n.custom[key]) ? fmtSeat(n.custom[key]) : '—';
+  }
   if(s.role === 'hunter') return '—';
   return '';
 }
@@ -1919,9 +2151,9 @@ function renderBoard(){
 
     return '<div class="'+cls+'" data-seat="'+p.seat+'" data-r="'+(hidden?'hidden':p.role)+'">'
       + '<div class="seat-no">'+fmtSeat(p.seat)+'</div>'
-      + '<div class="badge'+(hidden?' hidden-id':'')+'">'+(hidden ? '?' : r.badge)+'</div>'
+      + '<div class="badge'+(hidden?' hidden-id':'')+'">'+(hidden ? '?' : esc(r.badge))+'</div>'
       + '<div class="seat-name">'+esc(p.name)+'</div>'
-      + '<div class="seat-role">'+(hidden ? '身份已隐藏' : r.name)+'</div>'
+      + '<div class="seat-role">'+(hidden ? '身份已隐藏' : esc(r.name))+'</div>'
       + '<div class="seat-state">'+(pip?'<span class="pip"></span>':'')+stateTxt+'</div>'
       + (seats.length ? '<div class="tagrow">'+seats.join('')+'</div>' : '')
       + (showVote ? '<div class="votecount'+(vc===maxVote?' top':'')+'">'+vc+'</div>' : '')
@@ -1946,7 +2178,7 @@ function isTargetSeat(seat){
   if(m === 'mechGuard')  return n.mechGuard === seat;
   if(m === 'mechKill')   return n.mechKill === seat;
   if(m === 'pick'){
-    const r = curStep().role;
+    const r = customPickKey(curStep());
     return !!(n.custom && n.custom[r] === seat);
   }
   if(m === 'shot' || m === 'duel' || m === 'boom') return state.shotTarget === seat;
@@ -1963,6 +2195,7 @@ function renderStats(){
 
 /* ---------- 座位交互 ---------- */
 function onSeatClick(seat){
+  if(state.win){ toast('本局已经结束，请先复盘或重开'); return; }
   const p = getP(seat);
   if(!p) return;
 
@@ -1975,12 +2208,14 @@ function onSeatClick(seat){
 
   switch(state.pickMode){
     case 'kill':
+      if(!p.alive){ toast('只能击杀还活着的玩家'); return; }
       snap();
       state.night.kill = (state.night.kill === seat ? null : seat);
       if(state.night.kill) log('狼人选择击杀 '+fmtSeat(seat)+' 号 '+p.name);
       renderAll();
       break;
     case 'guard':
+      if(!p.alive){ toast('只能守护还活着的玩家'); return; }
       if(state.night.guardPrev === seat){
         toast('守卫不能连续两晚守护同一人');
         return;
@@ -1991,6 +2226,7 @@ function onSeatClick(seat){
       renderAll();
       break;
     case 'charm':
+      if(!p.alive){ toast('只能魅惑还活着的玩家'); return; }
       snap();
       state.night.charm = (state.night.charm === seat ? null : seat);
       state.charmLast = state.night.charm;
@@ -2054,7 +2290,8 @@ function onSeatClick(seat){
       renderAll();
       break;
     case 'pick': {
-      const r = curStep().role;
+      if(!p.alive){ toast('只能指定还活着的玩家'); return; }
+      const r = customPickKey(curStep());
       snap();
       state.night.custom = state.night.custom || {};
       state.night.custom[r] = (state.night.custom[r] === seat ? null : seat);
@@ -2070,6 +2307,7 @@ function onSeatClick(seat){
       renderAll();
       break;
     case 'seer':
+      if(!p.alive){ toast('只能查验还活着的玩家'); return; }
       snap();
       state.night.seer = seat;
       log('预言家查验 '+fmtSeat(seat)+' 号 '+p.name+' → '+(ROLES[p.role].camp==='wolf'?'狼人':'好人'), ROLES[p.role].camp==='wolf'?'danger':'ok');
@@ -2077,6 +2315,7 @@ function onSeatClick(seat){
       renderAll();
       break;
     case 'poison':
+      if(!p.alive){ toast('只能毒杀还活着的玩家'); return; }
       snap();
       state.night.poison = (state.night.poison === seat ? null : seat);
       state.night.save = false;
@@ -2085,9 +2324,7 @@ function onSeatClick(seat){
       renderAll();
       break;
     case 'vote':
-      state.votes[seat] = (state.votes[seat] || 0) + 1;
-      beep(520, .06, .12);
-      renderAll();
+      recordVote(seat);
       break;
     case 'speak':
       state.speakPointer = seat;
@@ -2100,9 +2337,8 @@ function onSeatClick(seat){
 
 function decVote(seat){
   if(!state.votes[seat]) return;
-  state.votes[seat] -= 1;
-  if(state.votes[seat] <= 0) delete state.votes[seat];
-  renderAll();
+  snap();
+  removeLastVoteFor(seat);
 }
 
 /* ---------- 座位菜单 ---------- */
@@ -2112,7 +2348,7 @@ function openSeatMenu(seat){
   const r = ROLES[p.role];
   const root = document.getElementById('ctxRoot');
   root.innerHTML = '<div class="ctx-menu">'
-    + '<div class="cm-head">'+fmtSeat(seat)+' 号 · '+esc(p.name)+' · '+r.name+'</div>'
+    + '<div class="cm-head">'+fmtSeat(seat)+' 号 · '+esc(p.name)+' · '+esc(r.name)+'</div>'
     + '<div class="cm-sub">出局原因</div>'
     + '<div class="cm-roles">'
     + '<button data-cm="dead" data-cause="wolf">狼人击杀</button>'
@@ -2126,7 +2362,7 @@ function openSeatMenu(seat){
     + '<div class="cm-sep"></div>'
     + '<div class="cm-sub">变更身份</div>'
     + '<div class="cm-roles">'
-    + Object.keys(ROLES).map(k=>'<button data-cm="role" data-role="'+k+'">'+ROLES[k].name+'</button>').join('')
+    + Object.keys(ROLES).map(k=>'<button data-cm="role" data-role="'+k+'">'+esc(ROLES[k].name)+'</button>').join('')
     + '</div>'
     + '</div>';
 
@@ -2154,6 +2390,10 @@ function onCtxAction(btn){
   const p = getP(ctxSeat);
   if(!p) return;
   const cm = btn.dataset.cm;
+  if(state.win && cm !== 'revive' && cm !== 'role'){
+    toast('本局已经结束；如要修正结果，请先复活或变更身份');
+    return;
+  }
   if(cm === 'dead'){
     snap();
     killSeat(ctxSeat, btn.dataset.cause || 'other');
@@ -2161,7 +2401,10 @@ function onCtxAction(btn){
     snap();
     p.alive = true; p.death = null;
     p.tags = p.tags.filter(t=>t!=='novote');
+    state.win = null;
+    recomputeCensus();
     log(fmtSeat(ctxSeat)+' 号复活（手动修正）', 'sys');
+    updateWin();
     renderAll();
   }else if(cm === 'novote'){
     snap();
@@ -2172,14 +2415,25 @@ function onCtxAction(btn){
     snap();
     const old = ROLES[p.role].name;
     p.role = btn.dataset.role;
+    state.win = null;
+    recomputeCensus();
     log(fmtSeat(ctxSeat)+' 号身份由「'+old+'」改为「'+ROLES[p.role].name+'」（手动修正）', 'sys');
+    updateWin();
     renderAll();
   }
   closeCtx();
 }
 
 /* ---------- 操作指令 ---------- */
-function handleAction(act){
+function handleAction(act, button){
+  if(state.win && act !== 'exit-screen'){
+    toast('本局已经结束，请先复盘或重开');
+    return;
+  }
+  if(hasPendingShot() && act !== 'shot-confirm' && act !== 'shot-cancel' && act !== 'exit-screen'){
+    toast('请先结算带走技能');
+    return;
+  }
   switch(act){
     case 'kill-clear':
       snap(); state.night.kill = null; log('狼人选择空刀（本夜无人被刀）'); renderAll();
@@ -2218,13 +2472,54 @@ function handleAction(act){
       resolveDawn();
       break;
     case 'vote-clear':
-      snap(); state.votes = {}; renderAll();
+      snap();
+      state.voteRecords = [];
+      state.votes = {};
+      state.voteVoter = null;
+      state.voteCandidates = state.voteCandidates || null;
+      renderAll();
       break;
+    case 'vote-set-voter': {
+      const seat = +(button && button.dataset.voter);
+      const voter = getP(seat);
+      if(!voter || !voter.alive || voter.tags.includes('novote')) return;
+      if((state.voteRecords || []).some(record => record.voterSeat === seat)){
+        toast('该玩家已经投过票');
+        return;
+      }
+      state.voteVoter = seat;
+      renderAll();
+      break;
+    }
     case 'vote-exile':
       if(!Object.keys(state.votes).length){ toast('还没有记录任何票数'); return; }
       snap();
       state.stepKey = 'exile'; state.pickMode = null;
       doExile();
+      renderAll();
+      break;
+    case 'vote-pk': {
+      const candidates = state.voteCandidates ? state.voteCandidates.slice() : [];
+      if(candidates.length < 2) return;
+      snap();
+      state.voteRound = (state.voteRound || 1) + 1;
+      state.voteRecords = [];
+      state.votes = {};
+      state.voteVoter = null;
+      state.voteCandidates = candidates;
+      state.exileResolved = false;
+      state.stepKey = 'vote';
+      state.pickMode = 'vote';
+      log('平票候选人 ' + candidates.map(fmtSeat).join('、') + ' 号进入第 ' + state.voteRound + ' 轮 PK 投票', 'sys');
+      renderAll();
+      toast('PK 重投开始，只能投给平票候选人');
+      break;
+    }
+    case 'vote-no-exile':
+      snap();
+      state.exileResolved = true;
+      state.voteCandidates = null;
+      log('平票处理：本轮无人出局', 'sys');
       renderAll();
       break;
     case 'exile-confirm':
@@ -2249,7 +2544,11 @@ function handleAction(act){
       mech.learned = p.role;
       mech.day = state.day;
       mech.target = target;
-      const sk = MECH_SKILL[p.role];
+      const sk = MECH_SKILL[p.role] || {
+        label: ROLES[p.role].name,
+        text: '自定义身份效果，按主持人现场规则处理',
+        timing: '手动'
+      };
       log('机械狼学习 '+fmtSeat(target)+' 号 '+p.name+'（'+ROLES[p.role].name+'）→ 学会「'+sk.label+'」：'+sk.text+'，'+sk.timing+'生效', 'danger');
       state.night.mechLearn = null;
       state.pickMode = null;
@@ -2279,7 +2578,7 @@ function handleAction(act){
       state.pickMode = 'pick'; state.shotTarget = null; renderAll();
       break;
     case 'custom-clear': {
-      const r = curStep().role;
+      const r = customPickKey(curStep());
       snap();
       if(state.night.custom) state.night.custom[r] = null;
       renderAll();
@@ -2310,13 +2609,25 @@ function handleAction(act){
       const tSeat = state.shotTarget;
       snap();
       state.boomUsed = true;
+      state.advanceToNightAfterShots = true;
       state.shotTarget = null;
       log('白狼王 '+fmtSeat(bw.seat)+' 号自爆，带走 '+fmtSeat(tSeat)+' 号 '+getP(tSeat).name, 'danger');
-      killSeat(bw.seat, 'boom');
-      killSeat(tSeat, 'boom');
-      toast('白狼王自爆，直接进入黑夜');
+      killSeat(bw.seat, 'boom', {deferWin:true, render:false});
+      killSeat(tSeat, 'boom', {deferWin:true, render:false});
       state.votes = {};
-      startNewNight();
+      state.voteRecords = [];
+      state.voteVoter = null;
+      updateWin();
+      if(state.win){
+        state.advanceToNightAfterShots = false;
+        renderAll();
+      }else if(hasPendingShot()){
+        renderAll();
+      }else{
+        state.advanceToNightAfterShots = false;
+        toast('白狼王自爆，直接进入黑夜');
+        startNewNight();
+      }
       break;
     }
     case 'shot-confirm': {
@@ -2331,8 +2642,8 @@ function handleAction(act){
       state.shotTarget = null;
       nextShot();
       log(tag+' '+fmtSeat(hSeat)+' 号带走 '+fmtSeat(target)+' 号 '+getP(target).name, 'danger');
-      killSeat(target, 'pierce');
-      renderAll();
+      killSeat(target, 'pierce', {deferWin:true, render:false});
+      finishShotSettlement();
       break;
     }
     case 'shot-cancel': {
@@ -2343,7 +2654,7 @@ function handleAction(act){
       if(h) h.tags.push('shotUsed');
       nextShot();
       log(tag+' 放弃带走');
-      renderAll();
+      finishShotSettlement();
       break;
     }
     case 'exit-screen':
@@ -2608,10 +2919,11 @@ function openSetup(mustStart){
     root.querySelector('#cWn').textContent = cfg.wolfTotal;
     root.querySelector('#cGn').textContent = cfg.gods.length;
     const normal = cfg.wolfTotal - cfg.wolves.length;
-    const vil = cfg.total - cfg.wolfTotal - cfg.gods.length;
+    const extraCount = cfgExtraCount(cfg);
+    const vil = cfg.total - cfg.wolfTotal - cfg.gods.length - extraCount;
     const errs = [];
     if(normal < 0) errs.push('特殊狼勾了 '+cfg.wolves.length+' 个，超过狼位 '+cfg.wolfTotal+'，请减少特殊狼或调大狼人数量');
-    if(vil < 0) errs.push('狼 '+cfg.wolfTotal+' + 神 '+cfg.gods.length+' 已超过总人数 '+cfg.total);
+    if(vil < 0) errs.push('狼 '+cfg.wolfTotal+' + 神 '+cfg.gods.length+' + 自定义 '+extraCount+' 已超过总人数 '+cfg.total);
     if(errs.length){
       hintEl.style.color = '#f0938b';
       hintEl.textContent = errs.join('；');
@@ -2622,7 +2934,8 @@ function openSetup(mustStart){
       ? cfg.wolves.map(k=>ROLES[k].name).join(' / ') + ' + ' + normal + ' 普通狼'
       : cfg.wolfTotal + ' 普通狼';
     const gtxt = cfg.gods.length ? cfg.gods.map(k=>ROLES[k].name).join(' / ') : '无神职';
-    hintEl.textContent = '共 '+cfg.total+' 人 ＝ '+cfg.wolfTotal+' 狼（'+wtxt+'）· '+cfg.gods.length+' 神（'+gtxt+'）· '+vil+' 民';
+    const xtxt = extraCount ? ' · '+extraCount+' 自定义' : '';
+    hintEl.textContent = '共 '+cfg.total+' 人 ＝ '+cfg.wolfTotal+' 狼（'+wtxt+'）· '+cfg.gods.length+' 神（'+gtxt+'）'+xtxt+' · '+vil+' 民';
   }
 
   function resizeNames(target){
@@ -2748,11 +3061,6 @@ function openSetup(mustStart){
   const finish = () => {
     const names = nameInput.value.split('\n').map(s=>s.trim());
     const sec = Math.max(15, Math.min(600, parseInt(root.querySelector('#speakInput').value) || 90));
-    const normal = cfg.wolfTotal - cfg.wolves.length;
-    const vil = cfg.total - cfg.wolfTotal - cfg.gods.length;
-    if(normal < 0){ toast('特殊狼超过狼位，请调整'); return; }
-    if(vil < 0){ toast('狼 + 神超过总人数，请调整'); return; }
-
     const extraArr = cfg.extra
       .filter(x=>(x.name||'').trim() !== '' && (x.count||0) > 0)
       .map((x,i)=>({
@@ -2764,6 +3072,11 @@ function openSetup(mustStart){
         wake: !!x.wake,
         order: x.order || 5.5
       }));
+    const normal = cfg.wolfTotal - cfg.wolves.length;
+    const extraCount = extraArr.reduce((sum, item) => sum + Math.max(1, +item.count || 1), 0);
+    const vil = cfg.total - cfg.wolfTotal - cfg.gods.length - extraCount;
+    if(normal < 0){ toast('特殊狼超过狼位，请调整'); return; }
+    if(vil < 0){ toast('狼 + 神 + 自定义身份超过总人数，请调整'); return; }
 
     const wolvesArr = [];
     for(let i=0;i<normal;i++) wolvesArr.push('wolf');
@@ -3128,7 +3441,12 @@ function bindEvents(){
     snap();
     state.players.forEach(p=>{ p.alive = true; p.death = null; });
     state.pendingShot = null;
+    state.shotQueue = [];
+    state.advanceToNightAfterShots = false;
+    state.win = null;
+    recomputeCensus();
     log('手动修正：全员恢复存活', 'sys');
+    updateWin();
     renderAll();
   });
 
@@ -3136,9 +3454,8 @@ function bindEvents(){
   document.getElementById('btnPrev').addEventListener('click', goPrev);
 
   document.getElementById('btnNextSpeaker').addEventListener('click', ()=>{
-    const alive = state.players.filter(p=>p.alive && !p.tags.includes('novote')).map(p=>p.seat).sort((a,b)=>a-b);
-    const all = state.players.filter(p=>p.alive).map(p=>p.seat).sort((a,b)=>a-b);
-    const pool = alive.length ? alive : all;
+    if(state.win) return;
+    const pool = state.players.filter(p=>p.alive).map(p=>p.seat).sort((a,b)=>a-b);
     if(!pool.length) return;
     const cur = state.speakPointer;
     let next = pool[0];
@@ -3159,14 +3476,20 @@ function bindEvents(){
   });
 
   document.getElementById('btnSkipNight').addEventListener('click', ()=>{
+    if(state.win) return;
     snap();
     state.stepKey = 'dawn'; state.pickMode = null;
     renderAll();
   });
   document.getElementById('btnSkipToVote').addEventListener('click', ()=>{
+    if(state.win) return;
     snap();
     state.phase = 'day'; state.stepKey = 'vote'; state.pickMode = 'vote';
     state.votes = {};
+    state.voteRecords = [];
+    state.voteVoter = null;
+    state.voteCandidates = null;
+    state.voteRound = 1;
     renderAll();
   });
   document.getElementById('btnGotoNight').addEventListener('click', ()=>{
@@ -3219,7 +3542,7 @@ function bindEvents(){
 
   document.addEventListener('click', e=>{
     const act = e.target.closest('[data-act]');
-    if(act){ handleAction(act.dataset.act); }
+    if(act){ handleAction(act.dataset.act, act); }
   });
 
   document.addEventListener('keydown', e=>{
@@ -3243,6 +3566,7 @@ const CLOUD_API = 'https://extendsclass.com/api/json-storage/bin';
 const ROOM_LS = 'ww_room_v1';
 const SEAT_LS = 'ww_myseat_';
 const CID_LS = 'ww_cid';
+const DEVICE_KEY_LS = 'ww_device_key_';
 
 let room = (function(){
   try{ const v = JSON.parse(localStorage.getItem(ROOM_LS) || 'null'); return (v && v.id) ? v : null; }catch(e){ return null; }
@@ -3318,7 +3642,9 @@ async function cloudGet(id, tries){
       if(!r.ok) throw new Error('HTTP ' + r.status);
       const j = parseLoose(await r.text());
       if(!j) throw new Error('数据读取失败');
-      return (j.data && typeof j.data === 'object') ? j.data : j;
+      const data = (j.data && typeof j.data === 'object') ? j.data : j;
+      if(data.deleted) throw new Error('房间不存在（可能已过期）');
+      return data;
     }catch(e){
       last = e;
       if(/房间不存在/.test((e && e.message) || '')) break;
@@ -3341,6 +3667,79 @@ async function cloudPut(id, data){
   }
   throw last || new Error('保存失败');
 }
+function bytesToBase64(bytes){
+  let binary = '';
+  for(let i=0;i<bytes.length;i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+function base64ToBytes(text){
+  const binary = atob(text);
+  const out = new Uint8Array(binary.length);
+  for(let i=0;i<binary.length;i++) out[i] = binary.charCodeAt(i);
+  return out;
+}
+async function getDeviceKey(rid){
+  if(!window.crypto || !window.crypto.subtle) throw new Error('当前浏览器不支持加密身份');
+  const keyName = DEVICE_KEY_LS + rid;
+  try{
+    const saved = JSON.parse(localStorage.getItem(keyName) || 'null');
+    if(saved && saved.pub && saved.priv) return saved;
+  }catch(e){}
+  const pair = await window.crypto.subtle.generateKey(
+    {name:'ECDH', namedCurve:'P-256'}, true, ['deriveKey']
+  );
+  const saved = {
+    pub: await window.crypto.subtle.exportKey('jwk', pair.publicKey),
+    priv: await window.crypto.subtle.exportKey('jwk', pair.privateKey)
+  };
+  try{ localStorage.setItem(keyName, JSON.stringify(saved)); }catch(e){}
+  return saved;
+}
+async function deriveRoomKey(privateJwk, publicJwk, usage){
+  const privateImport = Object.assign({}, privateJwk);
+  const publicImport = Object.assign({}, publicJwk);
+  delete privateImport.key_ops;
+  delete privateImport.ext;
+  delete publicImport.key_ops;
+  delete publicImport.ext;
+  const priv = await window.crypto.subtle.importKey(
+    'jwk', privateImport, {name:'ECDH', namedCurve:'P-256'}, false, ['deriveBits']
+  );
+  const pub = await window.crypto.subtle.importKey(
+    'jwk', publicImport, {name:'ECDH', namedCurve:'P-256'}, false, []
+  );
+  const bits = await window.crypto.subtle.deriveBits({name:'ECDH', public:pub}, priv, 256);
+  return window.crypto.subtle.importKey('raw', bits, {name:'AES-GCM'}, false, [usage]);
+}
+async function encryptRoleForSeat(role, playerPublicJwk){
+  const ephemeral = await window.crypto.subtle.generateKey(
+    {name:'ECDH', namedCurve:'P-256'}, true, ['deriveKey']
+  );
+  const ephemeralPublicJwk = await window.crypto.subtle.exportKey('jwk', ephemeral.publicKey);
+  const ephemeralPrivateJwk = await window.crypto.subtle.exportKey('jwk', ephemeral.privateKey);
+  const key = await deriveRoomKey(ephemeralPrivateJwk, playerPublicJwk, 'encrypt');
+  const iv = window.crypto.getRandomValues(new Uint8Array(12));
+  const cipher = await window.crypto.subtle.encrypt(
+    {name:'AES-GCM', iv}, key, new TextEncoder().encode(role)
+  );
+  return {
+    v: 1,
+    eph: ephemeralPublicJwk,
+    iv: bytesToBase64(iv),
+    ct: bytesToBase64(new Uint8Array(cipher))
+  };
+}
+async function decryptRoleForSeat(rid, encrypted){
+  if(!encrypted || !encrypted.eph || !encrypted.iv || !encrypted.ct) return null;
+  const device = await getDeviceKey(rid);
+  const key = await deriveRoomKey(device.priv, encrypted.eph, 'decrypt');
+  const plain = await window.crypto.subtle.decrypt(
+    {name:'AES-GCM', iv:base64ToBytes(encrypted.iv)},
+    key,
+    base64ToBytes(encrypted.ct)
+  );
+  return new TextDecoder().decode(plain);
+}
 function roomLink(id){
   let base = location.href.split('#')[0];
   try{ base = decodeURI(base); }catch(e){}
@@ -3359,26 +3758,61 @@ function hashRoomId(){
   const m = /room=([A-Za-z0-9_\-]+)/.exec(location.hash || '');
   return m ? m[1] : null;
 }
+async function updateRoomData(id, mutate, validate, tries){
+  const attempts = Math.max(1, tries || 4);
+  let last = null;
+  for(let i=0;i<attempts;i++){
+    try{
+      const base = await cloudGet(id, 2);
+      const next = await mutate(JSON.parse(JSON.stringify(base)));
+      next.rev = (+base.rev || 0) + 1;
+      next.ts = Date.now();
+      await cloudPut(id, next);
+      await cloudSleep(150);
+      const checked = await cloudGet(id, 2);
+      if(validate(checked, next)) return checked;
+      last = new Error('房间刚被其他人更新');
+    }catch(e){
+      last = e;
+      if(/不符合|不支持|已锁定|已被选|被选走|本设备|尚未选号|没有设备密钥/.test((e && e.message) || '')) throw e;
+    }
+    if(i < attempts - 1) await cloudSleep(250 * (i + 1));
+  }
+  throw last || new Error('房间更新冲突，请重试');
+}
 
 /* ---------- 上帝端：把本局身份推到云端 ---------- */
 async function pushIdentities(silent){
   if(!room || !room.id) return false;
   if(!state || !state.players || !state.players.length){ toast('先开局，再同步身份'); return false; }
-  const ids = {};
-  state.players.forEach(p=>{ ids[p.seat] = p.role; });
   try{
-    let base = roomCache;
-    if(!base) base = await cloudGet(room.id);
-    const seatsSrc = (base && base.seats) || {};
-    const seats = {};
-    Object.keys(seatsSrc).forEach(k=>{ if(+k >= 1 && +k <= state.players.length) seats[k] = seatsSrc[k]; });
-    await cloudPut(room.id, {
-      total: state.players.length,
-      seats, ids,
-      locked: true,
-      ts: Date.now()
+    const written = await updateRoomData(room.id, async base => {
+      const seatsSrc = base.seats || {};
+      const seats = {};
+      const identities = {};
+      for(let i=1;i<=state.players.length;i++){
+        const record = seatsSrc[String(i)];
+        if(!record){
+          throw new Error(fmtSeat(i) + ' 号尚未选号，不能锁定发牌');
+        }
+        if(!record.pub){
+          throw new Error(fmtSeat(i) + ' 号没有设备密钥，请解锁后让该玩家重新选号');
+        }
+        seats[String(i)] = record;
+        const player = state.players.find(item => item.seat === i);
+        identities[String(i)] = await encryptRoleForSeat(player.role, record.pub);
+      }
+      return {
+        total: state.players.length,
+        seats,
+        identities,
+        locked: true
+      };
+    }, checked => {
+      return !!(checked.locked && checked.identities &&
+        state.players.every(p => checked.identities[String(p.seat)] && checked.identities[String(p.seat)].ct));
     });
-    roomCache = null;
+    roomCache = written;
     toast(silent ? '身份已同步，玩家可以在手机上翻牌了' : '身份已同步到玩家手机');
     return true;
   }catch(e){
@@ -3427,7 +3861,7 @@ function paintRoom(){
     el.innerHTML = '<div class="rm-note">先建一个房间，把链接发到群里。每个人点进来先选自己是几号，'
       + '选过的号别人就选不了了。<br><br>所有人都选完后，你在「设置 → 随机发牌并开始」时，'
       + '身份会按座位固定下来并同步到各自手机，玩家在自己手机上翻牌看身份。<br><br>'
-      + '<b>前提：</b>需要联网。房间数据存在公共临时云服务上，理论上懂技术的人能读到全量身份，<b>别拿它开赌注局</b>。</div>'
+      + '<b>前提：</b>需要联网。身份会按每位玩家的设备密钥单独加密，房间 ID 本身读不到明文身份。</div>'
       + '<div class="rm-bar"><button class="btn btn-primary" id="rmCreate">创建房间（' + total + ' 个号位）</button></div>';
     const b = el.querySelector('#rmCreate');
     if(b) b.addEventListener('click', doCreateRoom);
@@ -3486,9 +3920,22 @@ function paintRoom(){
   const un = el.querySelector('#rmUnlock');
     if(un) un.addEventListener('click', doUnlockRoom);
   const dp = el.querySelector('#rmDrop');
-    if(dp) dp.addEventListener('click', ()=>{
+    if(dp) dp.addEventListener('click', async ()=>{
       if(!confirm('解散房间？玩家手里的链接会失效。')) return;
-      writeRoom(null); roomCache = null; paintRoom(); toast('房间已解散');
+      const id = room && room.id;
+      try{
+        if(id){
+          try{
+            const response = await cloudFetch(CLOUD_API + '/' + id, {method:'DELETE'});
+            if(!response.ok) throw new Error('HTTP ' + response.status);
+          }catch(deleteError){
+            await cloudPut(id, {deleted:true, locked:true, total:0, seats:{}, identities:{}, ts:Date.now()});
+          }
+        }
+        writeRoom(null); roomCache = null; paintRoom(); toast('房间已解散，旧链接已失效');
+      }catch(e){
+        toast('解散失败：' + (e.message || '网络问题'));
+      }
     });
 }
 
@@ -3497,7 +3944,7 @@ async function doCreateRoom(){
   if(b){ b.disabled = true; b.textContent = '创建中…'; }
   const total = (state && state.players && state.players.length) ? state.players.length : 12;
   try{
-    const data = { total, seats:{}, ids:{}, locked:false, ts: Date.now() };
+    const data = { total, seats:{}, identities:{}, locked:false, rev:0, ts: Date.now() };
     const id = await cloudCreate(data);
     writeRoom({ id, total, createdAt: Date.now() });
     roomCache = data;
@@ -3517,10 +3964,14 @@ async function doUnlockRoom(){
   if(!room || !room.id) return;
   if(!confirm('解锁后玩家可以重新选号，已同步的身份会作废。确定吗？')) return;
   try{
-    const base = roomCache || await cloudGet(room.id);
-    await cloudPut(room.id, Object.assign({}, base, { locked:false, ids:{}, ts: Date.now() }));
-    roomCache = null;
-    await refreshRoom();
+    const written = await updateRoomData(room.id,
+      current => {
+        const next = Object.assign({}, current, {locked:false, identities:{}});
+        delete next.ids;
+        return next;
+      },
+      checked => !checked.locked && !Object.keys(checked.identities || {}).length);
+    roomCache = written;
     toast('已解锁，玩家可以重新选号');
   }catch(e){
     toast('解锁失败：' + (e.message || '网络问题'));
@@ -3530,7 +3981,8 @@ async function doUnlockRoom(){
 /* ==================== 玩家端：手机选号 / 翻牌 ==================== */
 
 const CAMP_LABEL = { wolf:'狼人阵营', god:'神职阵营', vil:'平民阵营' };
-const P = { rid:null, data:null, err:'', mySeat:null, busy:false, name:'', revealed:false, timer:null, fails:0, fatal:false };
+const P = { rid:null, data:null, err:'', roleError:'', mySeat:null, busy:false, name:'',
+            role:null, revealed:false, timer:null, fails:0, fatal:false };
 
 function plEl(){ return document.getElementById('plWrap'); }
 
@@ -3571,13 +4023,24 @@ async function pPull(){
   try{
     const d = await cloudGet(P.rid, 3);
     P.data = d;
-    P.err = ''; P.fails = 0; P.fatal = false;
+    P.err = ''; P.roleError = ''; P.fails = 0; P.fatal = false;
     if(P.mySeat){
       const s = (d.seats || {})[String(P.mySeat)];
       if(s && s.cid && s.cid !== clientId()){
         P.mySeat = null;
+        P.role = null;
         try{ localStorage.removeItem(SEAT_LS + P.rid); }catch(e){}
         plToast('你的号被占用了，请重选一个');
+      }
+    }
+    P.role = null;
+    if(d.locked && P.mySeat && d.identities && d.identities[String(P.mySeat)]){
+      try{
+        const role = await decryptRoleForSeat(P.rid, d.identities[String(P.mySeat)]);
+        P.role = role && ROLES[role] ? role : null;
+        if(!P.role) P.roleError = '身份数据无效，请让上帝重新同步';
+      }catch(e){
+        P.roleError = '身份解密失败，请用最初选号的同一设备打开';
       }
     }
   }catch(e){
@@ -3591,7 +4054,7 @@ function pLoop(){
   if(P.timer) clearInterval(P.timer);
   P.timer = setInterval(async ()=>{
     if(!P.rid) return;
-    if(P.data && P.data.locked && P.mySeat) return;
+    if(P.data && P.data.locked && P.mySeat && P.role) return;
     if(P.fatal && P.fails >= 6) return;
     const ae = document.activeElement;
     if(ae && ae.id === 'plName') return;
@@ -3666,11 +4129,11 @@ function waitHTML(){
 
 function revealHTML(){
   const seat = String(P.mySeat).padStart(2,'0');
-  const role = (P.data.ids || {})[String(P.mySeat)];
+  const role = P.role;
   if(!role || !ROLES[role]){
     return '<div class="pl-wait"><div class="ring"></div>'
       + '<div class="pl-big">你是 ' + seat + ' 号</div>'
-      + '<div class="pl-sub">已经锁定了，但身份还没同步上来。稍等几秒，或者让上帝点「在线选号 → 同步当前身份」。</div>'
+      + '<div class="pl-sub">' + esc(P.roleError || '已经锁定了，正在解密你的身份牌，请稍等几秒。') + '</div>'
       + '</div><button class="pl-btn ghost" data-repull="1">重新获取</button>';
   }
   const r = ROLES[role];
@@ -3680,7 +4143,7 @@ function revealHTML(){
     + '<div class="pl-card ' + (on ? 'flip' : '') + '" id="plCard">'
     + '<div class="pc-seat">SEAT ' + seat + '</div>'
     + (on
-        ? '<div class="pc-role" style="color:' + ROLE_COLOR[role] + '">' + r.name + '</div>'
+        ? '<div class="pc-role" style="color:' + ROLE_COLOR[role] + '">' + esc(r.name) + '</div>'
           + '<div class="pc-camp">' + (CAMP_LABEL[r.camp] || '') + '</div>'
           + '<div class="pc-brief">' + esc(r.brief || '') + '</div>'
         : '<div class="pc-q">?</div><div class="pc-txt">点击翻开</div>')
@@ -3712,15 +4175,33 @@ async function pTake(seat){
   const nmEl = document.getElementById('plName');
   const nm = ((nmEl && nmEl.value) || P.name || '').trim().slice(0, 12);
   try{
-    const d = await cloudGet(P.rid);
-    if(d.locked){ P.data = d; plToast('已经锁定发牌了，不能再选号'); return; }
-    const seats = d.seats || {};
-    if(seats[String(seat)]){ P.data = d; plToast('慢了一步，这个号刚被选走'); return; }
-    seats[String(seat)] = { n: nm || (seat + '号'), cid: clientId(), t: Date.now() };
-    await cloudPut(P.rid, Object.assign({}, d, { seats, ts: Date.now() }));
+    const device = await getDeviceKey(P.rid);
+    const d = await updateRoomData(P.rid, base => {
+      if(base.locked) throw new Error('已经锁定发牌了');
+      const seats = base.seats || {};
+      const mine = Object.keys(seats).find(k => seats[k] && seats[k].cid === clientId());
+      if(mine && +mine !== seat) throw new Error('本设备已经占用 '+mine+' 号');
+      if(seats[String(seat)] && seats[String(seat)].cid !== clientId()){
+        throw new Error('这个号刚被选走');
+      }
+      seats[String(seat)] = {
+        n: nm || (seat + '号'),
+        cid: clientId(),
+        pub: device.pub,
+        t: Date.now()
+      };
+      base.seats = seats;
+      base.identities = base.identities || {};
+      return base;
+    }, checked => {
+      const mine = checked.seats && checked.seats[String(seat)];
+      return !!(mine && mine.cid === clientId() && mine.pub);
+    });
     P.mySeat = seat;
     P.name = nm;
-    P.data = Object.assign({}, d, { seats });
+    P.data = d;
+    P.role = null;
+    P.roleError = '';
     try{ localStorage.setItem(SEAT_LS + P.rid, String(seat)); }catch(e){}
   }catch(e){
     plToast('选号失败：' + (e.message || '网络问题') + '，再点一次试试');
@@ -3734,16 +4215,21 @@ async function pRelease(){
   if(!P.mySeat) return;
   if(!confirm('放弃 ' + P.mySeat + ' 号，重新选一个？')) return;
   try{
-    const d = await cloudGet(P.rid);
-    if(d.locked){ plToast('已经开始发牌，不能换号了'); return; }
-    const seats = d.seats || {};
-    const mine = seats[String(P.mySeat)];
-    if(mine && mine.cid === clientId()){
-      delete seats[String(P.mySeat)];
-      await cloudPut(P.rid, Object.assign({}, d, { seats, ts: Date.now() }));
-    }
+    const d = await updateRoomData(P.rid, base => {
+      if(base.locked) throw new Error('已经开始发牌');
+      const seats = base.seats || {};
+      const mine = seats[String(P.mySeat)];
+      if(mine && mine.cid === clientId()) delete seats[String(P.mySeat)];
+      base.seats = seats;
+      return base;
+    }, checked => {
+      const mine = checked.seats && checked.seats[String(P.mySeat)];
+      return !mine || mine.cid !== clientId();
+    });
     P.mySeat = null;
-    P.data = Object.assign({}, d, { seats });
+    P.role = null;
+    P.roleError = '';
+    P.data = d;
     try{ localStorage.removeItem(SEAT_LS + P.rid); }catch(e){}
     pPaint();
   }catch(e){
@@ -3753,7 +4239,20 @@ async function pRelease(){
 
 function boot(){
   if(hashRoomId()){ startPlayerMode(); return; }
-  const saved = load();
+  let saved = load();
+  if(saved){
+    const custom = (saved.customCfg && saved.customCfg.extra) ||
+      (saved.config && saved.config.extra) || [];
+    if(custom.length) registerCustomRoles(custom);
+    if(!isValidSavedState(saved)){
+      try{
+        const raw = localStorage.getItem(LS_KEY);
+        if(raw) localStorage.setItem(LS_KEY + '_invalid_' + Date.now(), raw);
+      }catch(e){}
+      toast('上次存档结构异常，已备份原数据并进入新局设置');
+      saved = null;
+    }
+  }
   if(saved && saved.players && saved.players.length){
     state = saved;
     if(!state.undos) state.undos = [];
@@ -3773,6 +4272,12 @@ function boot(){
     if(state.boomUsed === undefined) state.boomUsed = false;
     if(state.duelUsed === undefined) state.duelUsed = false;
     if(!state.shotQueue) state.shotQueue = [];
+    if(!Array.isArray(state.voteRecords)) state.voteRecords = [];
+    if(state.voteVoter === undefined) state.voteVoter = null;
+    if(state.voteCandidates === undefined) state.voteCandidates = null;
+    if(state.voteRound === undefined) state.voteRound = 1;
+    if(state.advanceToNightAfterShots === undefined) state.advanceToNightAfterShots = false;
+    if(state.voteRecords.length) recomputeVotes();
     if(state.pendingShot && typeof state.pendingShot === 'number'){
       state.pendingShot = {seat: state.pendingShot, type: 'hunter'};
     }
@@ -3800,6 +4305,7 @@ function boot(){
       });
       state.census = census;
     }
+    state.schemaVersion = 2;
     document.getElementById('actionZone').innerHTML = '';
     renderAll();
     tReset(state.speakSeconds || 90);
