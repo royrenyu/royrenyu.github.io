@@ -1,0 +1,24 @@
+name: Validate site
+# The checked-in index.html is the source of truth; never auto-pull third-party HTML.
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Static checks
+        run: node tests/static-check.mjs
+
+      - name: Rule tests
+        run: node --test tests/rules.test.mjs
